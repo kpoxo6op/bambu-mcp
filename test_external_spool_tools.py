@@ -58,7 +58,9 @@ def test_single_nozzle_holder_is_unchanged():
 
 def test_no_external_tray_is_not_loaded():
     r = _with_spools([])
-    assert r == {"loaded": False, "spool": None, "spools": []}, r
+    assert {k: r[k] for k in ("loaded", "spool", "spools")} == {"loaded": False, "spool": None, "spools": []}, r
+    # The stub state reports no switch; presence is never inferred.
+    assert r["hw_switch_state"] == -1 and "extrusion" in r["note"], r
 
 
 def test_ams_spools_are_not_external():

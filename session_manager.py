@@ -25,10 +25,24 @@ _BambuConfig = None
 _ServiceState = None
 
 
+def _reliability():
+    """reliability imports bpm; keep it out of session_manager's import time like bpm itself."""
+    import reliability
+    return reliability
+
+
+def _thread_alive(thread) -> bool | None:
+    """True/False for a session's loop thread, None when there is none (or no is_alive)."""
+    is_alive = getattr(thread, "is_alive", None) if thread is not None else None
+    return bool(is_alive()) if callable(is_alive) else None
+
+
 def _ensure_imports():
     global _BambuPrinter, _BambuConfig, _ServiceState
     if _BambuPrinter is None:
-        from bpm.bambuprinter import BambuPrinter
+        # ReliablePrinter: BambuPrinter with fault-isolated parsing, freshness tracking and a
+        # guarded publish path (reliability.py). Never edit bpm in .venv for MCP-layer problems.
+        from reliability import ReliablePrinter as BambuPrinter
         from bpm.bambuconfig import BambuConfig
         from bpm.bambutools import ServiceState
         _BambuPrinter = BambuPrinter
@@ -126,6 +140,9 @@ class SessionManager:
         # name → _NameGuard serialising every start and stop of that one printer. Entries exist
         # only while some thread holds or waits for them (see _restart_lock).
         self._restart_locks: dict = {}
+        # name → number of _start_printer calls in flight (building, waiting or starting), so the
+        # supervisor never mistakes a start in progress for a missing session.
+        self._starting: dict[str, int] = {}
         self._update_callbacks: list[Callable[[str], None]] = []
 
     def on_update(self, name: str) -> None:
@@ -156,7 +173,9 @@ class SessionManager:
         if skipped:
             logger.info("start_all: leaving %s disconnected, as they were last left", skipped)
         logger.info("start_all: starting sessions for %d printers: %s", len(names), names)
+        _reliability().supervisor.start(self)
         for name in names:
+            _reliability().supervisor.want(name)
             try:
                 self._start_printer(name)
             except Exception as e:
@@ -175,6 +194,8 @@ class SessionManager:
         # Every caller asks for the printer to be connected, so a restart reconnects it even if
         # this start fails (an unreachable printer is retried at the next daemon start).
         remember_connection(name, True)
+        _reliability().supervisor.want(name)
+        _reliability().supervisor.start(self)
         self._start_printer(name)
 
     @contextlib.contextmanager
@@ -202,7 +223,12 @@ class SessionManager:
                 if guard.users == 0:
                     del self._restart_locks[name]
 
-    def _start_printer(self, name: str) -> None:
+    def start_in_flight(self, name: str) -> bool:
+        """True while a ``_start_printer`` call for ``name`` has not returned."""
+        with self._lock:
+            return self._starting.get(name, 0) > 0
+
+    def _start_printer(self, name: str, replace_live: bool = True) -> bool:
         """Build a BambuPrinter for ``name``, register it and start its MQTT session.
 
         A session already registered under ``name`` is quit and replaced. Rebinding the entry
@@ -234,8 +260,23 @@ class SessionManager:
         is never held across ``quit()`` or ``start_session()``, which can block, so lookups
         never wait on a restart. Nothing here takes the per-name lock twice: the failure cleanup
         below calls ``_quit_printer`` directly, not ``stop_printer``.
+
+        ``replace_live=False`` (the supervisor's restart): under the per-name lock, a registered
+        session that is not dead is kept and False is returned, so a restart queued behind
+        another caller's start never replaces it. Returns True once the new session started.
         """
         logger.debug("_start_printer: called for name=%s", name)
+        with self._lock:
+            self._starting[name] = self._starting.get(name, 0) + 1
+        try:
+            return self._start_printer_locked(name, replace_live)
+        finally:
+            with self._lock:
+                self._starting[name] -= 1
+                if not self._starting[name]:
+                    del self._starting[name]
+
+    def _start_printer_locked(self, name: str, replace_live: bool) -> bool:
         creds = auth.get_printer_credentials(name)
         logger.debug("_start_printer: creating config ip=%s serial=%s access_code=<redacted>", creds["ip"], creds["serial"])
         overrides = _bpm_config_overrides()
@@ -251,16 +292,29 @@ class SessionManager:
         logger.debug("_start_printer: BambuPrinter object created for '%s'", name)
         printer.on_update = lambda _printer: self.on_update(name)
         with self._restart_lock(name):
+            # Checked under the lock: a start queued behind one that just abandoned a zombie
+            # (quit timed out, entry removed) must not start a second client next to it.
+            if _reliability().supervisor.zombie_since(name) is not None:
+                raise RuntimeError(f"previous MQTT session for '{name}' has not stopped; restart the bambu-mcp service")
             with self._lock:
                 previous = self._printers.get(name)
+                if not replace_live and previous is not None and not (
+                        callable(getattr(previous, "session_dead", None)) and previous.session_dead()):
+                    logger.info("_start_printer: '%s' already has a running session; not replacing it", name)
+                    return False
                 if previous is not None:
                     # Detach before the swap: bpm's quit() notifies through on_update, and once the
                     # registry holds the new printer that notification would resolve the name to the
                     # NEW client's blank state and read as a job boundary to every consumer.
                     previous.on_update = None
                 self._printers[name] = printer
-            if previous is not None:
-                self._quit_printer(name, previous)
+            if previous is not None and not self._quit_printer(name, previous):
+                # Never start a replacement next to threads that would not stop.
+                with self._lock:
+                    if self._printers.get(name) is printer:
+                        del self._printers[name]
+                _reliability().supervisor.add_zombie(name, previous)
+                raise RuntimeError(f"previous MQTT session for '{name}' did not stop; not starting a second one")
             logger.debug("_start_printer: calling start_session for '%s'", name)
             try:
                 printer.start_session()
@@ -273,9 +327,11 @@ class SessionManager:
                 self._quit_printer(name, printer)
                 raise
         logger.info("Session started for printer: %s", name)
+        return True
 
     def stop_all(self) -> None:
         """Stop all active sessions cleanly."""
+        _reliability().supervisor.stop()  # first, so nothing is restarted during shutdown
         with self._lock:
             names = list(self._printers.keys())
         logger.info("stop_all: stopping all sessions, count=%d", len(names))
@@ -290,21 +346,30 @@ class SessionManager:
         registry pop happens under ``self._lock``; ``quit()`` runs outside it.
         """
         logger.debug("stop_printer: called for name=%s", name)
+        _reliability().supervisor.unwant(name)  # an intentional stop is never auto-restarted
         with self._restart_lock(name):
             with self._lock:
                 printer = self._printers.pop(name, None)
             if printer is None:
                 logger.debug("stop_printer: printer '%s' not found (already stopped?)", name)
-            else:
-                self._quit_printer(name, printer)
+            elif not self._quit_printer(name, printer):
+                _reliability().supervisor.add_zombie(name, printer)
 
-    def _quit_printer(self, name: str, printer) -> None:
-        """Quit a printer already removed from (or replaced in) the registry; never raises."""
+    def _quit_printer(self, name: str, printer) -> bool:
+        """Quit a printer already removed from (or replaced in) the registry; never raises.
+
+        Returns False only when the quit is known not to have stopped the MQTT threads
+        (ReliablePrinter.quit is bounded and reports it); bpm's own quit() returns None.
+        """
         try:
-            printer.quit()
+            ok = printer.quit()
             logger.info("Session stopped for printer: %s", name)
         except Exception as e:
             logger.warning("Error stopping printer %s: %s", name, e, exc_info=True)
+            ok = None
+        if ok is False:
+            return False
+        return _thread_alive(getattr(printer, "_mqtt_client_thread", None)) is not True
 
     def get_printer(self, name: str):
         """Return the live BambuPrinter instance, or None if not connected."""
@@ -347,7 +412,9 @@ class SessionManager:
             return False
         try:
             _ensure_imports()
-            result = p.service_state == _ServiceState.CONNECTED
+            # CONNECTED with a dead loop thread is the 2026-11-01 incident: a label, not a session.
+            result = (p.service_state == _ServiceState.CONNECTED
+                      and _thread_alive(getattr(p, "_mqtt_client_thread", None)) is not False)
             logger.debug("is_connected: %s -> %s", name, result)
             return result
         except Exception:

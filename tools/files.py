@@ -1380,7 +1380,13 @@ def print_file(
     if blocked:
         return blocked
     try:
+        from bpm.bambuproject import get_project_info as _read_project
         from bpm.bambutools import PlateType
+        project = _read_project(file_path, printer, plate_num=plate_num)
+        if project is None or project.plate_num != plate_num or not project.metadata.get("filament"):
+            return {"error": "print_metadata_unavailable", "detail": "The requested plate and its filament must be verified before printing; no start command was sent."}
+        if bed_type and bed_type.upper() not in PlateType.__members__:
+            return {"error": "invalid_bed_type", "detail": bed_type}
         bed_enum = (
             PlateType[bed_type.upper()]
             if bed_type and bed_type.upper() in PlateType.__members__
@@ -1406,6 +1412,13 @@ def print_file(
                 resolved_ams_mapping = res["ams_mapping_json"]
                 matches = res["matches"]
         log.debug("print_file: calling printer.print_3mf_file for %s", name)
+        # Metadata/FTPS can take seconds. Recheck immediately before publishing.
+        blocked = check_active_print_guard(printer, name, "print_file")
+        if blocked:
+            return blocked
+        tray = getattr(printer.printer_state, "active_tray_state", "")
+        if getattr(tray, "name", str(tray)).upper() in ("LOADING", "UNLOADING"):
+            return {"error": "filament_change_in_progress", "detail": "Finish the filament change before starting a print."}
         printer.print_3mf_file(
             name=file_path,
             plate=plate_num,
@@ -1420,6 +1433,7 @@ def print_file(
         log.debug("print_file: → file=%s plate=%s bed_type=%s use_ams=%s ams_mapping=%s", file_path, plate_num, bed_enum.name, use_ams, resolved_ams_mapping)
         return {
             "success": True,
+            "status": "published_unconfirmed",
             "file_path": file_path,
             "plate_num": plate_num,
             "bed_type": bed_enum.name,

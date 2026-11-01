@@ -54,9 +54,14 @@ def _make_auth(access_code: str) -> bytes:
     return header + user + pwd
 
 
-def _read_exactly(sock, n: int) -> bytes:
+def _read_exactly(sock, n: int, deadline: float | None = None) -> bytes:
     buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Camera frame deadline exceeded")
+            sock.settimeout(remaining)
         chunk = sock.recv(min(4096, n - len(buf)))
         if not chunk:
             raise ConnectionError("Stream closed")
@@ -72,15 +77,31 @@ def capture_frame(ip: str, access_code: str, timeout: float = 30.0) -> bytes:
     Returns raw JPEG bytes.
     """
     log.info("capture_frame: connecting to %s:6000 timeout=%.1fs", ip, timeout)
+    deadline = time.monotonic() + timeout
     ctx = _make_ssl_context()
-    with socket.create_connection((ip, 6000), timeout=timeout) as raw:
-        sock = ctx.wrap_socket(raw, server_hostname=ip)
+    # wrap_socket detaches raw's fd, so the TLS socket needs its own context manager to close it.
+    with socket.create_connection((ip, 6000), timeout=timeout) as raw, \
+            ctx.wrap_socket(raw, server_hostname=ip) as sock:
         log.debug("capture_frame: TLS handshake complete, sending auth")
         sock.sendall(_make_auth(access_code))
-        raw_header = _read_exactly(sock, 16)
-        size = int.from_bytes(raw_header[:4], "little")
-        log.debug("capture_frame: reading JPEG payload size=%d", size)
-        data = _read_exactly(sock, size)
+        # P1/A1 can replay an old frame on connection. Discard it and wait
+        # for a subsequent frame before presenting this as a live snapshot.
+        frames = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("No fresh camera frame before deadline")
+            sock.settimeout(remaining)
+            raw_header = _read_exactly(sock, 16, deadline)
+            size = int.from_bytes(raw_header[:4], "little")
+            if not 0 < size <= 8_000_000:
+                raise ValueError("Invalid camera frame size")
+            data = _read_exactly(sock, size, deadline)
+            if not data.startswith(b"\xff\xd8"):
+                raise ValueError("Camera did not return a JPEG frame")
+            frames += 1
+            if frames >= 2:
+                break
         log.info("capture_frame: → %d bytes from %s", len(data), ip)
         return data
 

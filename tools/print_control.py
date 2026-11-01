@@ -477,9 +477,9 @@ def send_gcode(
     bypassing all print-job safety checks. Incorrect commands can crash the toolhead, damage the
     printer, or trigger a fault. With ``user_permission`` unset the tool changes nothing and
     returns the refusal string naming that consequence. It is also blocked during active prints,
-    judged from the last telemetry this server received: it blocks only when gcode_state reads
-    RUNNING or PREPARE, and does NOT block when the state is empty or unreadable (before the
-    first status report, or while the MQTT session is paused and the cached state is stale).
+    judged from live telemetry: RUNNING and PREPARE are blocked. The registered MCP tool
+    also refuses writes before a complete state report and while telemetry is stale, paused,
+    disconnected or incomplete.
     Every other state, including PAUSE, is allowed through. When the block does not apply, the
     G-code is sent as-is and could crash the toolhead into the print or trigger hardware faults.
 

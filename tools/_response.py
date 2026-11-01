@@ -53,7 +53,9 @@ def _save_tracker(data: dict) -> None:
 
 
 def _update_mcp_config(tokens: int) -> None:
-    """Write MAX_MCP_OUTPUT_TOKENS into ~/.copilot/mcp-config.json env block."""
+    """Update Copilot only when explicitly opted in by that client."""
+    if os.environ.get("BAMBU_MCP_ALLOW_CLIENT_CONFIG_WRITE") != "1":
+        return
     try:
         cfg = json.loads(_MCP_CONFIG_PATH.read_text()) if _MCP_CONFIG_PATH.exists() else {}
         servers = cfg.setdefault("mcpServers", {})

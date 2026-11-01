@@ -12,6 +12,7 @@ Usage:
 
 import atexit
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
@@ -35,9 +36,10 @@ from prompts.context import bambu_system_context
 # ── Tool modules ───────────────────────────────────────────────────────────────
 from tools._registry import register_tools
 
-_log_level = logging.ERROR
-_log_file = Path(__file__).parent / "bambu-mcp.log"
-_file_handler = logging.FileHandler(_log_file, encoding="utf-8")
+_log_level = logging.WARNING
+_log_file = Path.home() / ".bambu-mcp" / "bambu-mcp.log"
+_log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+_file_handler = RotatingFileHandler(_log_file, maxBytes=10_000_000, backupCount=3, encoding="utf-8")
 _file_handler.setLevel(_log_level)
 _file_handler.setFormatter(logging.Formatter(
     "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -240,11 +242,12 @@ def _startup() -> None:
     except Exception as exc:
         log.warning(f"Startup error (sessions not started): {exc}")
 
-    try:
-        import api_server
-        api_server.start(log_level_setter=set_log_level)
-    except Exception as exc:
-        log.warning(f"API server startup error: {exc}")
+    if os.environ.get("BAMBU_MCP_DISABLE_REST") != "1":
+        try:
+            import api_server
+            api_server.start(log_level_setter=set_log_level)
+        except Exception as exc:
+            log.warning(f"API server startup error: {exc}")
 
 
 def _shutdown() -> None:
@@ -334,12 +337,23 @@ def main() -> None:
         atexit.register(_dp.cleanup_files)
         mcp.settings.host = _dp.DAEMON_HOST
         mcp.settings.port = _port
+        # MCP clients must remain usable after a supervised process restart. A stateful
+        # HTTP session ID dies with the process and leaves clients receiving 404 forever.
+        # Printer state/sessions already live in the global manager, not HTTP sessions.
+        mcp.settings.stateless_http = True
         # Run startup in a background thread — printer SSL handshakes can block
         # for 30+ seconds, exceeding the daemon script's port-file wait window.
         threading.Thread(target=_startup, daemon=True, name="bambu-mcp-startup").start()
         log.info(f"Starting Bambu Lab MCP server (transport: {transport}, port: {_port})")
-        mcp.run(transport=transport)
+        # Same trap as stdio: on SIGTERM the interpreter would join bpm's non-daemon threads
+        # before atexit, so _shutdown never ran and systemd had to SIGKILL. Stop them here.
+        try:
+            mcp.run(transport=transport)
+        finally:
+            _stdio_teardown()
     elif transport == "stdio":
+        from runtime_lock import claim
+        claim()
         # Run startup in a background thread so mcp.run() can respond to the
         # MCP initialize request immediately. Copilot CLI has a 60s init timeout;
         # printer SSL handshakes block startup long enough to exceed it. Tools
@@ -348,7 +362,16 @@ def main() -> None:
         import threading
         threading.Thread(target=_startup, daemon=True, name="bambu-mcp-startup").start()
         log.info(f"Starting Bambu Lab MCP server (transport: {transport})")
-        mcp.run(transport=transport)
+        try:
+            mcp.run(transport=transport)
+        except BaseException as exc:
+            # SIGTERM/SIGINT (SystemExit from _signal_handler) or a crash while stdin is still
+            # open: anyio's non-daemon stdin reader stays blocked in read() and, like bpm's
+            # threads, would hold the interpreter at exit forever. Stop everything, then leave.
+            log.warning("stdio server ending: %r", exc)
+            _stdio_teardown()
+            logging.shutdown()
+            os._exit(exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else 1)
         log.info("stdin closed: the session that started this server is gone, shutting down")
         _stdio_teardown()
     else:

@@ -14,11 +14,19 @@ open_charts, open_job_state, open_plate_layout, open_plate_viewer), as is analyz
 whose store_as_reference option is an opt-in mode; they are not idempotent because each repeat
 opens another window. get_pending_alerts is read-only because its purpose is to read, with the
 queue drain documented. Titles carry a "Bambu: " prefix so they stay unique across the MCP servers a client registers together.
+
+Every tool is registered through tools._guards.guard_tool: it runs on a bounded thread pool
+instead of FastMCP's event-loop thread, printer writes are refused unless reliability.health()
+says the session is writable, and live-state reads that are not current come back as
+``telemetry_not_live`` with ``last_known``. Every non-read-only tool must be listed in
+_guards.PRINTER_WRITE_TOOLS or _guards.NON_PRINTER_WRITE_TOOLS, or startup raises.
 """
 
 from __future__ import annotations
 
 from mcp.types import ToolAnnotations
+
+from tools._guards import check_tool_classification, guard_tool
 
 import tools.camera
 import tools.charts
@@ -63,6 +71,7 @@ URL_FACTORY_NAMES: frozenset[str] = frozenset({
 })
 
 ANNOTATIONS: dict[str, tuple[str, bool, bool, bool, bool]] = {
+    "get_camera_image": ("Bambu: Fresh Camera Image", True, False, True, False),
     "add_printer": ("Bambu: Add Printer", False, True, False, True),
     "analyze_active_job": ("Bambu: Analyze Active Print Job", True, False, False, True),
     "calibrate_ams_remaining": ("Bambu: Rescan AMS Spool RFID", False, False, True, True),
@@ -195,10 +204,12 @@ def register_tools(mcp) -> int:
         raise RuntimeError(
             f"tool annotations out of step with registered tools: missing={missing} orphaned={orphaned}"
         )
+    # Every write tool must be classified as printer write or not; see tools/_guards.py.
+    check_tool_classification(ANNOTATIONS)
     for fn in fns:
         title, read_only, destructive, idempotent, open_world = ANNOTATIONS[fn.__name__]
         mcp.add_tool(
-            fn,
+            guard_tool(fn),
             title=title,
             annotations=ToolAnnotations(
                 title=title,

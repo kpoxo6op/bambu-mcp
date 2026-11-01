@@ -81,7 +81,7 @@ Run `.venv/bin/python3 server.py --transport streamable-http` and point the clie
 ## Tools
 
 <!-- gen_docs:tools:begin -->
-104 tools (51 read-only, 53 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
+105 tools (52 read-only, 53 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
 
 | Category | Tools |
 |---|---|
@@ -96,7 +96,7 @@ Run `.venv/bin/python3 server.py --transport streamable-http` and point the clie
 | [System](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/system/) | `dump_log`, `force_state_refresh`, `get_firmware_version`, `get_server_info`, `get_session_status`, `get_user_pref`, `pause_mqtt_session`, `rename_printer`, `resume_mqtt_session`, `set_print_options`, `set_user_pref`, `trigger_printer_refresh`, `truncate_log` |
 | [Discovery](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/discovery/) | `discover_printers` |
 | [Raw Commands](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/commands/) | `send_mqtt_command` |
-| [Camera](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/camera/) | `analyze_active_job`, `get_stream_url`, `open_job_state`, `start_stream`, `stop_stream`, `view_stream` |
+| [Camera](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/camera/) | `analyze_active_job`, `get_camera_image`, `get_stream_url`, `open_job_state`, `start_stream`, `stop_stream`, `view_stream` |
 | [Alerts](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/notifications/) | `get_pending_alerts` |
 | [Snapshots & Monitoring Data](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/snapshots/) | `get_monitoring_data`, `get_monitoring_history`, `get_monitoring_series`, `get_snapshot` |
 | [Charts](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/charts/) | `open_charts`, `render_charts_html`, `render_charts_panels` |

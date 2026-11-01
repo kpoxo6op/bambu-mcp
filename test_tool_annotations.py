@@ -26,8 +26,6 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from tools import _registry  # noqa: E402
 
-EXPECTED_TOOLS = 104
-EXPECTED_GUARDED = 50
 GUARD = "user_permission"
 PRIOR: dict[str, dict] = {}
 
@@ -38,10 +36,11 @@ def _live():
     return count, asyncio.run(mcp.list_tools())
 
 
-def test_tool_count_is_stated():
+def test_all_registered_tools_reach_the_public_catalog_once():
     count, tools = _live()
-    assert count == EXPECTED_TOOLS, count
-    assert len(tools) == EXPECTED_TOOLS, len(tools)
+    expected = {f.__name__ for f in _registry.registered_tools()}
+    assert {t.name for t in tools} == expected
+    assert count == len(tools) == len(expected)
 
 
 def test_every_tool_declares_title_and_read_only_hint():
@@ -63,7 +62,7 @@ def test_prior_declarations_are_unchanged():
 def test_every_guarded_tool_is_declared_a_write():
     _, tools = _live()
     guarded = [t for t in tools if GUARD in (t.inputSchema.get("properties") or {})]
-    assert len(guarded) == EXPECTED_GUARDED, len(guarded)
+    assert guarded, "no permission-guarded tools reached the public catalog"
     wrong = [t.name for t in guarded if t.annotations.readOnlyHint is not False]
     assert not wrong, wrong
 

@@ -1162,7 +1162,7 @@ class MJPEGServer:
             allocated_port = _pp.allocate(preferred=port)
             log.info("MJPEGServer.start: starting '%s' on port %d", name, allocated_port)
             server = _MJPEGHTTPServer(
-                ("", allocated_port), _StreamHandler, relay,
+                ("127.0.0.1", allocated_port), _StreamHandler, relay,
                 status_fn=status_fn, thumbnail_fn=thumbnail_fn, layout_fn=layout_fn,
                 printer_name=name,
                 on_idle=(lambda n=name: self.stop(n)) if idle_stop else None,

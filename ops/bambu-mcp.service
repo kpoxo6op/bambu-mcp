@@ -1,0 +1,19 @@
+[Unit]
+Description=Shared local Bambu MCP connection
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/boris/.local/share/bambu-mcp/launch.py --http
+WorkingDirectory=/home/boris/.local/share/bambu-mcp
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+SuccessExitStatus=143
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

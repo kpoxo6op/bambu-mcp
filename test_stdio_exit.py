@@ -15,6 +15,7 @@ Run directly (no pytest needed):  .venv/bin/python3 test_stdio_exit.py
 """
 
 import subprocess
+import os
 import sys
 import tempfile
 import time
@@ -59,6 +60,7 @@ def _run_server_at_eof(release: bool, grace: float, timeout: float):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, "HOME": tmp},
         )
         try:
             proc.wait(timeout=timeout)

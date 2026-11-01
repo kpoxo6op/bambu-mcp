@@ -238,8 +238,8 @@ def get_job_info(name: str) -> dict:
           does not read a cache). On a miss, try subtask_name + ".3mf", the form bpm falls
           back to.
 
-        Values are the last telemetry received; they go stale, with no error, while the MQTT
-        session is paused (pause_mqtt_session) or the connection has dropped.
+        Values come from MQTT telemetry. The registered MCP tool returns telemetry_not_live
+        with last_known values when the session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_job_info: called for printer=%s", name)
     job = session_manager.get_job(name)
@@ -271,11 +271,9 @@ def get_temperatures(name: str) -> dict:
         ``{"error": "Printer '<name>' not connected"}``.
 
     Notes:
-        Values are the last telemetry this server received, not a fresh read. They go stale,
-        with no error returned, while the MQTT session is paused (``pause_mqtt_session``) or
-        the connection has dropped. Check ``get_session_status`` /
-        ``get_printer_connection_status``, or ``recent_update`` in ``get_printer_state``, when
-        freshness matters.
+        Values come from MQTT telemetry. The registered MCP tool returns telemetry_not_live
+        with last_known values when the session is stale, paused, disconnected or incomplete.
+        Use get_printer_connection_status for telemetry ages and recovery status.
     """
     log.debug("get_temperatures: called for printer=%s", name)
     state = session_manager.get_state(name)
@@ -331,8 +329,8 @@ def get_fan_speeds(name: str) -> dict:
         current session (sticky): it persists unchanged across telemetry updates, reads 0
         after a session start or restart and on printers with no extension-tool module, is
         zeroed when the extension tool leaves the MOUNTED state, and never reflects a command
-        sent by another client. The other fan values are the last telemetry received and go
-        stale, with no error, while the MQTT session is paused or the connection has dropped.
+        sent by another client. The registered MCP tool returns telemetry_not_live with last_known values
+        when the session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_fan_speeds: called for printer=%s", name)
     state = session_manager.get_state(name)
@@ -440,8 +438,8 @@ def get_spool_info(name: str) -> dict:
           Derived from the color field with the alpha channel stripped; when color is already
           a name, color_name equals it. Use color_name for human-readable descriptions.
 
-        Values are the last telemetry received; they go stale, with no error, while the MQTT
-        session is paused (pause_mqtt_session) or the connection has dropped.
+        Values come from MQTT telemetry. The registered MCP tool returns telemetry_not_live
+        with last_known values when the session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_spool_info: called for printer=%s", name)
     state = session_manager.get_state(name)
@@ -498,8 +496,8 @@ def get_ams_status(name: str) -> dict:
         Only values of 1 or 2 indicate a moisture problem. Value 5 = completely dry.
         Value 0 = sensor reading unavailable (do not treat as wet).
 
-        Values are the last telemetry received; they go stale, with no error, while the MQTT
-        session is paused (pause_mqtt_session) or the connection has dropped.
+        Values come from MQTT telemetry. The registered MCP tool returns telemetry_not_live
+        with last_known values when the session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_ams_status: called for printer=%s", name)
     state = session_manager.get_state(name)
@@ -566,8 +564,8 @@ def get_hms_errors(name: str) -> dict:
           its high byte and the severity mask in its low byte; the other segments are
           module-specific identifiers. Entries derived from print_error (type "device_error")
           have two segments: HMS_XXXX-XXXX.
-        - Values are the last telemetry received; they go stale, with no error, while the MQTT
-          session is paused (pause_mqtt_session) or the connection has dropped.
+        - The registered MCP tool returns telemetry_not_live with last_known values when the
+          session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_hms_errors: called for printer=%s", name)
     state = session_manager.get_state(name)
@@ -615,8 +613,8 @@ def get_print_progress(name: str) -> dict:
           (objects skipped via skip_objects()). Empty list when no objects have been
           skipped or no print is active.
 
-        Values are the last telemetry received; they go stale, with no error, while the MQTT
-        session is paused (pause_mqtt_session) or the connection has dropped.
+        Values come from MQTT telemetry. The registered MCP tool returns telemetry_not_live
+        with last_known values when the session is stale, paused, disconnected or incomplete.
     """
     log.debug("get_print_progress: called for printer=%s", name)
     state = session_manager.get_state(name)

@@ -1,0 +1,37 @@
+diff --git a/src/bpm/bambuproject.py b/src/bpm/bambuproject.py
+index 956b7b4..42b34d4 100644
+--- a/src/bpm/bambuproject.py
++++ b/src/bpm/bambuproject.py
+@@ -851,18 +851,21 @@ def get_project_info(
+                 with zf.open(f"Metadata/plate_{num}.json") as f:
+                     plate_map = f.read()
+ 
+-                with zf.open(f"Metadata/plate_{num}.png") as f:
+-                    thumbnail_png = f.read()
+-                with zf.open(f"Metadata/top_{num}.png") as f:
+-                    top_view_png = f.read()
+-
+                 pi.metadata = {}
+-                pi.metadata["thumbnail"] = (
+-                    f"data:image/png;base64,{base64.b64encode(thumbnail_png).decode()}"
+-                )
+-                pi.metadata["topimg"] = (
+-                    f"data:image/png;base64,{base64.b64encode(top_view_png).decode()}"
+-                )
++                # Headless slicing can omit previews from an otherwise valid
++                # printable archive. Keep its objects and material mapping.
++                for image_path, image_key in (
++                    (f"Metadata/plate_{num}.png", "thumbnail"),
++                    (f"Metadata/top_{num}.png", "topimg"),
++                ):
++                    try:
++                        with zf.open(image_path) as f:
++                            image_data = f.read()
++                    except KeyError:
++                        continue
++                    pi.metadata[image_key] = (
++                        f"data:image/png;base64,{base64.b64encode(image_data).decode()}"
++                    )
+ 
+                 pi.metadata["map"] = json.loads(plate_map)
+                 objects = get_nodes_by_plate_id(slice_info_cfg, num, "object")

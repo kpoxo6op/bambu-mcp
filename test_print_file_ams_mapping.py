@@ -196,6 +196,7 @@ def _stubbed(spools, filaments, gpi=None):
     sm.get_printer = lambda name: printer
     bp.get_project_info = gpi or (
         lambda path, p, plate_num=1: types.SimpleNamespace(
+            plate_num=plate_num,
             metadata={"filament": filaments, "ams_mapping": [str(f["id"]) for f in filaments]}
         )
     )
@@ -258,16 +259,16 @@ def test_print_file_refuses_when_project_info_is_none():
     # bpm returns None (no raise) for a plate the file does not contain.
     printer, result = _run([Spool(0, 0, "PLA", "#FF0000")], [], gpi=lambda *a, **k: None, use_ams=True)
     assert printer.calls == []
-    assert "no filament metadata" in result["error"], result
+    assert result["error"] == "print_metadata_unavailable", result
 
 
 def test_print_file_refuses_when_metadata_has_no_filaments():
     printer, result = _run(
         [Spool(0, 0, "PLA", "#FF0000")], [],
-        gpi=lambda *a, **k: types.SimpleNamespace(metadata={"map": {}}), use_ams=True,
+        gpi=lambda *a, **k: types.SimpleNamespace(plate_num=1, metadata={"map": {}}), use_ams=True,
     )
     assert printer.calls == []
-    assert "no filament metadata" in result["error"], result
+    assert result["error"] == "print_metadata_unavailable", result
 
 
 def test_print_file_refuses_when_every_filament_id_is_unusable():
@@ -277,9 +278,9 @@ def test_print_file_refuses_when_every_filament_id_is_unusable():
 
 
 def test_print_file_caller_mapping_bypasses_resolution():
-    def boom(*a, **k):
-        raise AssertionError("metadata must not be read when a mapping is supplied")
-    printer, result = _run([], [], gpi=boom, ams_mapping=[1, -1, 128], use_ams=False)
+    # Explicit mapping bypasses tray selection, not the plate-integrity preflight.
+    printer, result = _run([], [F(1,"ABS","#000000"), F(3,"ABS-S","#FFFFFF")],
+                           ams_mapping=[1, -1, 128], use_ams=False)
     assert result.get("success") is True, result
     assert printer.calls[0]["ams_mapping"] == "[1, -1, 128]"
     assert printer.calls[0]["use_ams"] is True
@@ -297,13 +298,12 @@ def test_print_file_refuses_when_metadata_unreadable():
         raise OSError("FTPS timeout")
     printer, result = _run([Spool(0, 0, "PLA", "#FF0000")], [], gpi=boom, use_ams=True)
     assert printer.calls == []
-    assert "Could not read project metadata" in result["error"], result
+    assert "FTPS timeout" in result["error"], result
 
 
 def test_print_file_use_ams_false_sends_empty_mapping():
-    def boom(*a, **k):
-        raise AssertionError("metadata must not be read when use_ams=False")
-    printer, result = _run([], [], gpi=boom, use_ams=False)
+    # External spool still verifies the plate, but never resolves an AMS tray.
+    printer, result = _run([], [F(1,"PETG","#000000")], use_ams=False)
     assert result.get("success") is True, result
     assert printer.calls[0]["ams_mapping"] == ""
     assert printer.calls[0]["use_ams"] is False

@@ -438,7 +438,8 @@ def get_printer_connection_status(name: str) -> dict:
 
     Returns:
         ``{"name": str, "configured": bool, "session_active": bool, "connected": bool,
-        "service_state": str | None, "recent_update": bool | None}``. There is no error shape for
+        "service_state": str | None, "recent_update": bool | None, "live": bool,
+        "telemetry": dict}``. There is no error shape for
         an unknown name: it returns configured=False, session_active=False, connected=False and
         None for the two optional fields.
 
@@ -454,7 +455,15 @@ def get_printer_connection_status(name: str) -> dict:
         last value (a paused session can still read True) and it reads False on a session whose
         report stream never went live. It is set True only when an info/module reply arrives, not
         on every report message. It flags a stalled telemetry connection, not printer activity.
-        None when no session object exists.
+        None when no session object exists. Do NOT treat it as freshness: on 2026-11-01 a dead
+        session kept recent_update True and served a pre-job IDLE frame while the printer printed.
+
+        ``live`` / ``telemetry`` are the authoritative freshness answer (reliability.health):
+        ``telemetry.status`` is one of live, starting, incomplete, stale, disconnected, recovering,
+        stuck, paused, not_connected, unknown, with ``reason``, ``age_s`` (last_received,
+        last_telemetry, last_usable, baseline, connected_for, in_callback_for), message counters, restarts and
+        ``writable``. Printer writes are refused unless ``writable`` is True; state tools return
+        ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
     """
     log.debug("get_printer_connection_status: called for name=%s", name)
     configured_names = auth.get_configured_printer_names()
@@ -473,7 +482,9 @@ def get_printer_connection_status(name: str) -> dict:
             recent_update = bool(printer.recent_update)
         except Exception:
             pass
-    log.debug("get_printer_connection_status: %s -> configured=%s session_active=%s connected=%s service_state=%s recent_update=%s", name, configured, session_active, connected, service_state, recent_update)
+    import reliability
+    telemetry = reliability.health(name)
+    log.debug("get_printer_connection_status: %s -> configured=%s session_active=%s connected=%s service_state=%s recent_update=%s telemetry=%s", name, configured, session_active, connected, service_state, recent_update, telemetry.get("status"))
     return {
         "name": name,
         "configured": configured,
@@ -481,4 +492,6 @@ def get_printer_connection_status(name: str) -> dict:
         "connected": connected,
         "service_state": service_state,
         "recent_update": recent_update,
+        "live": bool(telemetry.get("live")),
+        "telemetry": telemetry,
     }

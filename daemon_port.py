@@ -65,21 +65,17 @@ def set_daemon_mode(enabled: bool = True) -> None:
 
 
 def ensure_singleton() -> None:
-    """Enforce that only one bambu-mcp HTTP daemon can run at a time.
+    """Claim the per-user OS lock shared by HTTP and stdio instances.
 
-    Checks the PID file for a live process. If one exists, raises
-    RuntimeError — the caller must not proceed with startup.
+    Process death releases the lock; PID/port files are discovery hints only.
 
     Raises:
         RuntimeError: If a live daemon process is already running.
     """
-    pid = read_pid_file()
-    if pid is not None and check_pid_alive(pid):
-        port = read_port_file()
-        raise RuntimeError(
-            f"bambu-mcp daemon already running (PID {pid}, port {port}). "
-            f"Stop it first with: ./bambu-mcp-daemon.sh stop"
-        )
+    # PID existence is subject to races and PID reuse. The kernel lock is the
+    # authority and is shared with stdio, which otherwise bypasses the daemon.
+    from runtime_lock import claim
+    claim()
     # Stale files from a dead process — clean up before proceeding.
     if read_pid_file() is not None or read_port_file() is not None:
         log.warning("ensure_singleton: cleaning up stale PID/port files from dead daemon")

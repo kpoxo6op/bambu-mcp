@@ -2528,7 +2528,7 @@ def _build_app():
         """Return the bambu-mcp server log."""
         log.debug("dump_log: called")
         try:
-            log_path = os.path.join(os.path.dirname(__file__), "bambu-mcp.log")
+            log_path = os.path.expanduser("~/.bambu-mcp/bambu-mcp.log")
             if not os.path.isfile(log_path):
                 return Response("", mimetype="text/plain")
             with open(log_path, "r") as f:
@@ -3249,7 +3249,7 @@ def start(port: int | None = None, log_level_setter=None) -> int:
 
     def _run():
         global _werkzeug_server
-        log.info("start: _run: serving on http://0.0.0.0:%s", _port)
+        log.info("start: _run: serving on http://127.0.0.1:%s", _port)
         try:
             import logging as _logging
             _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
@@ -3282,7 +3282,7 @@ def start(port: int | None = None, log_level_setter=None) -> int:
                             return len(b)
                     return _LogWriter()
 
-            _werkzeug_server = _make_server("0.0.0.0", _port, _safe_app,
+            _werkzeug_server = _make_server("127.0.0.1", _port, _safe_app,
                                             server_class=WSGIServer,
                                             handler_class=_QuietHandler)
             log.info("start: _run: wsgiref server created, entering serve_forever")

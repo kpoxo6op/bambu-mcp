@@ -456,9 +456,9 @@ def load_filament(
 
         To find the correct unit_id: call get_ams_units() and use the positional
         index (0-based) of the desired unit in the returned list. ams_id values are assigned
-        by the printer and should not be hardcoded. unit_id must resolve to a
-        connected AMS unit even when slot_id is 254; otherwise the tool returns the
-        "AMS unit not found" error.
+        by the printer and should not be hardcoded. For an external holder
+        (slot_id 254/255), unit_id is ignored: no AMS hardware is required.
+        On a single-nozzle printer only holder 254 is valid.
 
         ⛔ BLOCKED during active prints (gcode_state RUNNING or PREPARE), because a filament
         change during a print risks toolhead crashes or failed prints.
@@ -478,7 +478,13 @@ def load_filament(
     blocked = check_active_print_guard(printer, name, "load_filament")
     if blocked:
         return blocked.get("error", "Blocked: active print in progress.")
-    ams_id = _resolve_ams_id(name, unit_id)
+    if slot_id in (254, 255):
+        state = printer.printer_state
+        if slot_id == 255 and len(getattr(state, "extruders", [])) < 2:
+            return "Error: External holder 255 requires a dual-nozzle printer; use 254."
+        ams_id = slot_id
+    else:
+        ams_id = _resolve_ams_id(name, unit_id)
     if ams_id is None:
         return f"Error: AMS unit {unit_id} not found on '{name}'."
     try:
@@ -919,8 +925,11 @@ def get_external_spool(name: str) -> dict:
         that holder. Identify the holder by ``id`` (254 or 255), not by ``slot_id``.
         "spool" is the entry that holds a filament type, preferring 254 over 255, and falls
         back to the first entry when none holds one. "spools" lists every external entry so a
-        dual-nozzle caller can see both holders. Error shape:
-        ``{"error": "Printer '<name>' not connected"}``.
+        dual-nozzle caller can see both holders. Every success shape also carries
+        ``hw_switch_state`` (the extruder filament switch: 1 filament present, 0 none, -1 not
+        reported) and a ``note``. Neither ``loaded`` nor ``hw_switch_state`` 1 proves that
+        filament feeds, extrudes or adheres; confirm that visually (``get_camera_image``) or by
+        the operator. Error shape: ``{"error": "Printer '<name>' not connected"}``.
 
     Notes:
         Telemetry names the holders 254 and 255. A single-nozzle printer has one physical
@@ -938,9 +947,16 @@ def get_external_spool(name: str) -> dict:
     ]
     external.sort(key=lambda s: (0 if getattr(s, "type", "") else 1, 0 if 254 in (s.id, s.slot_id) else 1))
     log.debug("get_external_spool: returning result for %s", name)
+    sensor = {
+        "hw_switch_state": getattr(state, "hw_switch_state", -1),
+        "note": ("loaded = an external tray metadata entry exists. hw_switch_state 1 = the "
+                 "extruder switch senses filament (presence only). Neither proves feeding, "
+                 "extrusion or adhesion."),
+    }
     if external:
-        return {"loaded": True, "spool": _serialize(external[0]), "spools": [_serialize(s) for s in external]}
-    return {"loaded": False, "spool": None, "spools": []}
+        return {"loaded": True, "spool": _serialize(external[0]),
+                "spools": [_serialize(s) for s in external], **sensor}
+    return {"loaded": False, "spool": None, "spools": [], **sensor}
 
 
 def calibrate_ams_remaining(

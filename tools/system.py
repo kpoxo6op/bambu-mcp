@@ -178,7 +178,8 @@ def pause_mqtt_session(name: str, user_permission: bool = False) -> str:
     Notes:
         Telemetry is the continuous stream of printer state updates (temperatures, fan speeds,
         print progress) received over MQTT. While paused, tools that read live state
-        (get_printer_state, get_temperatures, etc.) will return stale data. Pausing an
+        (get_printer_state, get_temperatures, etc.) return telemetry_not_live with last_known
+        values. Pausing an
         already-paused session is a no-op that still returns the success string.
     """
     log.debug("pause_mqtt_session: called for name=%s user_permission=%s", name, user_permission)
@@ -684,11 +685,11 @@ def dump_log(tail_lines: int = 200) -> dict:
         ``{"error": "Error reading log file: <exception>"}``.
 
     Notes:
-        The log file is ``bambu-mcp.log`` in the bambu-mcp install directory (the repository
-        root); ``log_path`` in the result gives its absolute path.
+        The log is ``~/.bambu-mcp/bambu-mcp.log``; ``log_path`` gives its absolute path.
+        It rotates at 10 MB with three backups.
 
-        The log file captures entries at the current runtime log level (both root and bpm boot
-        fixed at ERROR; no env var sets this). Use POST /api/set_log_level?level=DEBUG&bpm_level=DEBUG
+        The log file captures entries at the current runtime log level (root boots at WARNING, bpm at ERROR;
+        no env var sets this). Use POST /api/set_log_level?level=DEBUG&bpm_level=DEBUG
         for full debug output, then POST /api/set_bpm_verbose?printer=<name>&verbose=true to also
         capture raw MQTT message payloads from bpm — see docs/operators-guide.md Debug-logging SOP.
 
@@ -699,12 +700,12 @@ def dump_log(tail_lines: int = 200) -> dict:
     """
     log.debug("dump_log: called with tail_lines=%s", tail_lines)
     from pathlib import Path
-    log_path = Path(__file__).parent.parent / "bambu-mcp.log"
+    log_path = Path.home() / ".bambu-mcp" / "bambu-mcp.log"
     log.debug("dump_log: log_path=%s", log_path)
     try:
         if not log_path.exists():
             log.debug("dump_log: log file does not exist at %s", log_path)
-            return {"lines": [], "total_lines": 0, "log_path": str(log_path), "note": "Log file does not exist yet — entries will appear once the server logs at its current level (boots at ERROR; raise via /api/set_log_level)."}
+            return {"lines": [], "total_lines": 0, "log_path": str(log_path), "note": "Log file does not exist yet — entries will appear once the server logs at its current level (boots at WARNING; raise via /api/set_log_level)."}
         with open(log_path, encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
         lines = [l.rstrip("\n") for l in all_lines[-tail_lines:]]
@@ -722,8 +723,8 @@ def truncate_log(user_permission: bool = False) -> dict:
     WHEN to use: start with a clean log after a debugging session. It is a server-level
     operation and takes no printer parameter.
 
-    WRITE GUARD: empties the server log file (``bambu-mcp.log`` in the bambu-mcp install
-    directory) to 0 bytes, permanently discarding every line it holds. With ``user_permission``
+    WRITE GUARD: empties ``~/.bambu-mcp/bambu-mcp.log`` to 0 bytes,
+    permanently discarding every line it holds. With ``user_permission``
     unset the tool changes nothing and returns the refusal naming that consequence.
 
     Sibling disambiguation: ``truncate_log`` destroys the log contents; ``dump_log`` only reads
@@ -746,7 +747,7 @@ def truncate_log(user_permission: bool = False) -> dict:
             "This would permanently erase the entire bambu-mcp server log file."
         )}
     from pathlib import Path
-    log_path = Path(__file__).parent.parent / "bambu-mcp.log"
+    log_path = Path.home() / ".bambu-mcp" / "bambu-mcp.log"
     log.debug("truncate_log: log_path=%s", log_path)
     try:
         with open(log_path, "w") as f:

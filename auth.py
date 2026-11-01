@@ -10,10 +10,38 @@ Configured printer names are stored as a JSON list under key "_printer_names".
 from __future__ import annotations
 
 import logging
+import json
+import os
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 import secrets_store
+
+
+def _studio_printer() -> tuple[str, dict] | None:
+    """Resolve one explicitly selected printer from existing Bambu Studio credentials.
+
+    The access code stays in the existing Studio file and process memory. It is
+    never copied into MCP client configuration, arguments, or a second vault.
+    """
+    config_path = os.environ.get("BAMBU_STUDIO_CONFIG")
+    if not config_path:
+        return None
+    name = os.environ.get("BAMBU_PRINTER_NAME", "p1s")
+    serial = os.environ.get("BAMBU_PRINTER_SERIAL", "")
+    host = os.environ.get("BAMBU_PRINTER_HOST", "")
+    if not serial or not host:
+        raise ValueError("Studio credential source requires an explicit printer serial and host")
+    try:
+        # raw_decode: Studio may append a "# MD5 checksum" line after the JSON object.
+        data, _ = json.JSONDecoder().raw_decode(Path(config_path).read_text().lstrip())
+        code = data.get("user_access_code", {}).get(serial) or data.get("access_code", {}).get(serial)
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise ValueError("Cannot read the configured Bambu Studio credential source") from None
+    if not isinstance(code, str) or len(code) != 8 or not code.isascii() or not code.isalnum():
+        raise ValueError("No valid LAN access code for the configured printer serial")
+    return name, {"ip": host, "access_code": code, "serial": serial}
 
 
 def get_printer_credentials(name: str) -> dict:
@@ -21,6 +49,11 @@ def get_printer_credentials(name: str) -> dict:
     Return {ip, access_code, serial} for a configured printer.
     Raises KeyError if the printer has no stored credentials.
     """
+    studio = _studio_printer()
+    if studio is not None:
+        if name != studio[0]:
+            raise KeyError("Printer is not the configured Studio printer")
+        return studio[1]
     log.debug("get_printer_credentials: called for name=%s", name)
     prefix = f"bambu-{name}"
     ip = secrets_store.get(f"{prefix}_ip")
@@ -69,6 +102,9 @@ def delete_printer_credentials(name: str) -> None:
 
 def get_configured_printer_names() -> list[str]:
     """Return the list of configured printer names."""
+    studio = _studio_printer()
+    if studio is not None:
+        return [studio[0]]
     log.debug("get_configured_printer_names: called")
     names = secrets_store.get("_printer_names", default=[])
     log.debug("get_configured_printer_names: → %s", names)

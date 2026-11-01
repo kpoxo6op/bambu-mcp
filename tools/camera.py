@@ -36,6 +36,30 @@ from camera.mjpeg_server import mjpeg_server
 from camera.protocol import get_protocol, get_rtsps_url
 from camera.status_helpers import build_active_filament
 from tools.url_factory import _q
+from mcp.server.fastmcp import Image as MCPImage
+
+_snapshot_lock = threading.Lock()
+
+def get_camera_image(name: str):
+    """Capture a fresh camera frame as an MCP image, without an HTTP server or browser.
+
+    Read-only. Use this for visual inspection; a successful printer command or
+    filament sensor does not prove physical extrusion or first-layer adhesion.
+    """
+    printer, err = _get_printer_checked(name)
+    if err:
+        return err
+    if not _snapshot_lock.acquire(timeout=1):
+        return {"error": "camera_busy", "detail": "Another snapshot is in progress; retry this read later"}
+    try:
+        return MCPImage(data=_capture_jpeg(printer), format="jpeg")
+    except Exception as exc:
+        detail = str(exc)
+        if printer.config.access_code:
+            detail = detail.replace(printer.config.access_code, "<redacted>")
+        return {"error": "camera_capture_failed", "detail": detail}
+    finally:
+        _snapshot_lock.release()
 
 def _no_printer(name: str) -> dict:
     return {"error": f"Printer '{name}' not connected"}
