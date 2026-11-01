@@ -3,18 +3,17 @@
 > forge ❯ bambu ❯ **mcp** · application · `claude-forge-bambu-mcp`
 >
 > **Archetype:** MCP server + REST API daemon
-> **Language:** Python 3.12+ · setuptools · `.venv/` local install
+> **Language:** Python 3.12+ · setuptools · `.venv-candidate/` local install
 > **Interfaces:** MCP (stdio/SSE) · HTTP REST (49152+) · camera streams (fMP4/MSE)
 > **Depends on:** 📦 bambu-printer-manager — MQTT, FTPS, state
-> **Shared rules:** `~/ai/forge/bambu/.claude/rules/bambu-ecosystem.md`
 
 ## Build / Validate
 
 - Per-file: `python -m py_compile <file>.py`
 - E2E tests only: `.venv-candidate/bin/python harness/run.py --rounds 3 --cycles 8`. See `harness/README.md`. Do not add unit/mock or direct-import smoke tests.
-- Reload: `~/bin/mcp-reload`
-- Full restart sequence: see shared rules — MCP Server Restart
-- Published docs (bpm site, `bambu-mcp` tab): after any tool, docstring, route or `docs/site/overview.md` change, run `.venv/bin/python3 gen_docs.py`, then stage `../bambu-printer-manager/docs/bambu-mcp/` in bpm (user-only commit there). It also refreshes the README Tools block.
+- Rebuild on a new machine: `python3.14 ops/bootstrap.py`; follow `docs/recovery.md`.
+- Shared runtime: `bambu-mcp.service`. Use the existing HTTP endpoint; do not create a competing MQTT session.
+- Tool documentation: after changing tools, docstrings, routes or `docs/site/overview.md`, run `.venv-candidate/bin/python gen_docs.py`. Stage `vendor/bambu-printer-manager/docs/bambu-mcp/` and the README tool block in this repository.
 - Daemon administration (launchd supervision, restart, log levels, debug logging): `docs/operators-guide.md` — the daemon is launchd-supervised; do NOT rely on `bambu-mcp-daemon.sh restart` for env changes
 
 ## Architecture

@@ -1,15 +1,15 @@
 
 >
 > **Archetype:** MCP server + REST API daemon
-> **Language:** Python 3.12+ · setuptools · `.venv/` local install
+> **Language:** Python 3.12+ · setuptools · `.venv-candidate/` local install
 > **Interfaces:** MCP (stdio/SSE) · HTTP REST (49152+) · MJPEG streams
 
 ## Build / Validate
 
 - Per-file: `python -m py_compile <file>.py`
 - E2E tests only: `.venv-candidate/bin/python harness/run.py --rounds 3 --cycles 8`. See `harness/README.md`. Do not add unit/mock or direct-import smoke tests.
-- Reload: `~/bin/mcp-reload`
-- Full restart sequence: see shared rules — MCP Server Restart
+- Rebuild on a new machine: `python3.14 ops/bootstrap.py`; follow `docs/recovery.md`.
+- Shared runtime: `bambu-mcp.service`. Use the existing HTTP endpoint; do not create a competing MQTT session.
 
 ## Architecture
 

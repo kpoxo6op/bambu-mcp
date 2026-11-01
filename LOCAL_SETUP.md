@@ -1,7 +1,7 @@
 # Local P1S MCP
 
 Based on `synman/bambu-mcp` v0.9.0, commit
-`7001c3b79e53d8a215223026db44fc4f0577fde2`, branch `platt-local`.
+`7001c3b79e53d8a215223026db44fc4f0577fde2`, branch `main`.
 Published fork: https://github.com/kpoxo6op/bambu-mcp.
 See `docs/recovery.md` for a rebuild on another machine.
 

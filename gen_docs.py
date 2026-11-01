@@ -7,7 +7,7 @@ Client Container section. Nothing here touches a printer or starts a session.
 
 Sources, all read live from this checkout:
   - MCP tools: a scratch FastMCP server fed by tools._registry.register_tools(), the same
-    registration path the daemon uses (as test_tool_annotations.py does). server.py is never
+    registration path the daemon uses. server.py is never
     imported, so no log file, session or atexit hook is created.
   - REST API: api_server.build_openapi_document(api_server._build_app()), the document the
     running daemon serves at /api/openapi.json.
@@ -16,11 +16,11 @@ Sources, all read live from this checkout:
 Also refreshes the tool summary between the gen_docs markers in README.md.
 
 Usage:
-    .venv/bin/python3 gen_docs.py [OUT_DIR]
+    .venv-candidate/bin/python gen_docs.py [OUT_DIR]
 
-OUT_DIR defaults to ../bambu-printer-manager/docs/bambu-mcp. Every file in it is generated:
+OUT_DIR defaults to vendor/bambu-printer-manager/docs/bambu-mcp. Every file in it is generated:
 the directory is emptied of stale .md files first. Re-run after any tool, docstring, route or
-overview change, then stage the pages in bambu-printer-manager.
+overview change, then stage the generated pages in this repository.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 import api_server  # noqa: E402
 from tools import _registry  # noqa: E402
 
-DEFAULT_OUT = ROOT.parent / "bambu-printer-manager" / "docs" / "bambu-mcp"
+DEFAULT_OUT = ROOT / "vendor" / "bambu-printer-manager" / "docs" / "bambu-mcp"
 REPO_URL = "https://github.com/synman/bambu-mcp"
 OVERVIEW_SRC = ROOT / "docs" / "site" / "overview.md"
 README = ROOT / "README.md"
