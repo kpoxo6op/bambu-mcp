@@ -11,10 +11,10 @@
 ## Build / Validate
 
 - Per-file: `python -m py_compile <file>.py`
-- Smoke test: `.venv/bin/python3 smoke_test.py`
+- E2E tests only: `.venv-candidate/bin/python harness/run.py --rounds 3 --cycles 8`. See `harness/README.md`. Do not add unit/mock or direct-import smoke tests.
 - Reload: `~/bin/mcp-reload`
 - Full restart sequence: see shared rules — MCP Server Restart
-- Published docs (bpm site, `bambu-mcp` tab): after any tool, docstring, route or `docs/site/overview.md` change, run `.venv/bin/python3 gen_docs.py`, then stage `../bambu-printer-manager/docs/bambu-mcp/` in bpm (user-only commit there). It also refreshes the README Tools block. `.venv/bin/python3 test_gen_docs.py` checks the generator.
+- Published docs (bpm site, `bambu-mcp` tab): after any tool, docstring, route or `docs/site/overview.md` change, run `.venv/bin/python3 gen_docs.py`, then stage `../bambu-printer-manager/docs/bambu-mcp/` in bpm (user-only commit there). It also refreshes the README Tools block.
 - Daemon administration (launchd supervision, restart, log levels, debug logging): `docs/operators-guide.md` — the daemon is launchd-supervised; do NOT rely on `bambu-mcp-daemon.sh restart` for env changes
 
 ## Architecture

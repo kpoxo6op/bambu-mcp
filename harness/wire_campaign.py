@@ -1,10 +1,12 @@
-"""End-to-end faults through MCP HTTP -> real paho -> a TLS MQTT test peer.
+"""E2E workflows and faults through MCP HTTP and TLS MQTT/FTPS/camera peers.
 
-Unlike callback fakes, this catches reconnection/queue behavior in the pinned paho,
-serialization over MCP, and process shutdown. Run only inside run.py's namespace.
+Exercises the installed libraries, MCP serialization and process lifecycle.
+Run only inside run.py's namespace.
 Seeds are recorded and replayable. No production credentials or printer address.
 """
 import asyncio
+import base64
+import gzip
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,7 @@ if os.environ.get("BAMBU_HARNESS_ISOLATED") != "1":
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from printer_peers import FTPSPeer, CameraPeer
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,7 +56,7 @@ class Broker:
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(tmp/"cert.pem", tmp/"key.pem")
         self.listener = socket.socket()
-        self.listener.bind(("127.0.0.1", 0))
+        self.listener.bind(("127.0.0.1", 8883))
         self.port = self.listener.getsockname()[1]
         self.listener.listen()
         self.listener.settimeout(.2)
@@ -62,7 +65,7 @@ class Broker:
         self.received = []
         self.connections = 0
         self.maximum = 0
-        self.reports = True
+        self.reports = False
         self.running = False
         self.block_reads = False
         self.stop = threading.Event()
@@ -178,15 +181,17 @@ def payload(r):
         value = r.structuredContent
         if isinstance(value, dict) and set(value) == {"result"}:
             value = value["result"]
-        if not isinstance(value,str):
-            return value
         text = value
     else:
         text = "\n".join(c.text for c in r.content if c.type == "text")
-    try:
-        return json.loads(text)
-    except ValueError:
-        return text
+    if isinstance(text, str):
+        try:
+            text = json.loads(text)
+        except ValueError:
+            pass
+    if isinstance(text, dict) and text.get("encoding") == "gzip+base64":
+        return json.loads(gzip.decompress(base64.b64decode(text["data"])))
+    return text
 
 async def campaign(seed, cycles):
     rng = random.Random(seed)
@@ -194,10 +199,16 @@ async def campaign(seed, cycles):
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         broker = Broker(tmp)
+        ftps = FTPSPeer(broker.ctx)
+        camera = CameraPeer(broker.ctx)
+        studio = tmp / "BambuStudio.conf"
+        studio.write_text(json.dumps({"user_access_code":{"01P00TESTONLY":"TESTONLY"}}))
         port = 25099  # private network namespace; production's registered port range
         env = os.environ.copy()
         env.update(HOME=str(tmp/"home"), BAMBU_MCP_PORT=str(port), BAMBU_MCP_DISABLE_REST="1",
-                   HARNESS_MQTT_PORT=str(broker.port), BAMBU_MCP_ALLOW_CLIENT_CONFIG_WRITE="0")
+                   BAMBU_MCP_ALLOW_CLIENT_CONFIG_WRITE="0", BAMBU_STUDIO_CONFIG=str(studio),
+                   BAMBU_PRINTER_NAME="fixture", BAMBU_PRINTER_SERIAL="01P00TESTONLY",
+                   BAMBU_PRINTER_HOST="127.0.0.1", BAMBU_MCP_FTPS_TIMEOUT="2")
         Path(env["HOME"]).mkdir()
         log = (tmp/"server.log").open("w+")
         proc = subprocess.Popen([sys.executable, str(ROOT/"harness/fixture_server.py")],
@@ -217,7 +228,7 @@ async def campaign(seed, cycles):
                     names = {t.name for t in (await c.list_tools()).tools}
                     assert "get_printer_connection_status" in names
                     async def call(tool, **args):
-                        return payload(await asyncio.wait_for(c.call_tool(tool, {"name":"fixture", **args}), 6))
+                        return payload(await asyncio.wait_for(c.call_tool(tool, {"name":"fixture", **args}), 10))
                     async def until_live():
                         start = time.monotonic()
                         for _ in range(140):
@@ -226,6 +237,14 @@ async def campaign(seed, cycles):
                                 return time.monotonic()-start
                             await asyncio.sleep(.1)
                         raise AssertionError(f"not live: {h}")
+                    starting = await call("get_print_progress")
+                    assert starting.get("error") == "telemetry_not_live", starting
+                    refused = await call("set_bed_temp", temp=0, user_permission=True)
+                    assert "telemetry_not_live" in str(refused), refused
+                    assert not broker.mutations(), broker.mutations()
+                    events.append({"contract":"startup without telemetry refuses writes", "sent":0})
+                    broker.reports = True
+                    broker.broadcast()
                     await until_live()
                     from watchdog import probe as watchdog_probe
                     assert (await watchdog_probe(f"http://127.0.0.1:{port}/mcp", "fixture"))["live"]
@@ -256,6 +275,11 @@ async def campaign(seed, cycles):
                             await asyncio.sleep(.2)
                             progress = await call("get_print_progress")
                             assert progress.get("gcode_state") == ("RUNNING" if broker.running else "IDLE"), progress
+                            for _ in range(20):
+                                if ftps.resets:
+                                    break
+                                await asyncio.sleep(.1)
+                            assert ftps.resets, "job transition never reached the FTPS reset peer"
                         if fault != "job-ftps-reset":
                             state = await call("get_print_progress")
                             assert state.get("error") == "telemetry_not_live", state
@@ -341,12 +365,92 @@ async def campaign(seed, cycles):
                     assert proc.pid != old_pid
                     events.append({"fault":"server-SIGKILL-same-MCP-client",
                                    "recovery_s":round(time.monotonic()-start,3),"replayed":0})
+                    # Public workflows use the actual parser and FTPS client, with a real
+                    # archive downloaded over TLS. No tool/library method is replaced.
+                    ftps.reset = False
+                    project = await call("get_project_info", file_path="fixture-job.gcode.3mf")
+                    assert project.get("plate_num") == 1, project
+                    assert "PETG" in json.dumps(project) and "coupon_post.stl" in json.dumps(project), project
+                    assert "fixture-job.gcode.3mf" in ftps.downloads, ftps.downloads
+                    events.append({"contract":"previewless 3MF downloads and parses over FTPS"})
+                    before = len(broker.mutations())
+                    denied = await call("load_filament", unit_id=0, slot_id=254)
+                    assert "user_permission" in str(denied), denied
+                    wrong_holder = await call("load_filament", unit_id=0, slot_id=255, user_permission=True)
+                    assert "dual-nozzle" in str(wrong_holder), wrong_holder
+                    for filename, plate in [("broken.gcode.3mf",1),("fixture-job.gcode.3mf",2)]:
+                        refused = await call("print_file", file_path=filename, plate_num=plate,
+                                             use_ams=False, user_permission=True)
+                        assert "error" in refused, refused
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"permission, invalid holder and invalid plate refuse before sending", "sent":0})
+                    loaded = await call("load_filament", unit_id=0, slot_id=254, user_permission=True)
+                    assert "Load filament command sent" in str(loaded), loaded
+                    commands = broker.mutations()[before:]
+                    assert len(commands) == 1, commands
+                    load = commands[0]["print"]
+                    assert (load["command"],load["target"],load["ams_id"],load["slot_id"]) == (
+                        "ams_change_filament",254,254,0), load
+                    events.append({"contract":"external holder loads without AMS", "sent":1})
+                    await until_live()
+                    before = len(broker.mutations())
+                    printed = await call("print_file", file_path="fixture-job.gcode.3mf",
+                                         use_ams=False, user_permission=True)
+                    assert "error" not in printed, printed
+                    await asyncio.sleep(.1)
+                    commands = broker.mutations()[before:]
+                    assert len(commands) == 1, commands
+                    command = commands[0]["print"]
+                    assert command["command"] == "project_file" and command["use_ams"] is False, command
+                    assert command["ams_mapping"] == [-1], command
+                    events.append({"contract":"external spool print reaches the wire once", "sent":1})
+                    broker.running = True
+                    broker.broadcast()
+                    for _ in range(20):
+                        if (await call("get_print_progress")).get("gcode_state") == "RUNNING":
+                            break
+                        await asyncio.sleep(.1)
+                    else:
+                        raise AssertionError("RUNNING telemetry not delivered")
+                    before = len(broker.mutations())
+                    for tool, args in [
+                        ("load_filament", {"unit_id":0,"slot_id":254}),
+                        ("print_file", {"file_path":"fixture-job.gcode.3mf","use_ams":False}),
+                        ("send_gcode", {"gcode":"G1 X20"}),
+                    ]:
+                        refused = await call(tool, user_permission=True, **args)
+                        assert "Blocked" in str(refused), (tool, refused)
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"active print refuses load, new print and G-code", "sent":0})
+                    for invalid in (False, True, False):
+                        camera.invalid = invalid
+                        result = await asyncio.wait_for(c.call_tool("get_camera_image", {"name":"fixture"}), 10)
+                        if invalid:
+                            assert payload(result).get("error") == "camera_capture_failed", result
+                        else:
+                            frames = [x for x in result.content if x.type == "image"]
+                            assert len(frames) == 1 and base64.b64decode(frames[0].data) == camera.frames[1], result
+                    # Active-job monitoring may capture extra frames concurrently. The
+                    # three public responses above own freshness/error/recovery checks;
+                    # the peer only requires that those authenticated connections exist.
+                    assert camera.authenticated >= 3, camera.authenticated
+                    events.append({"contract":"camera returns fresh second frame and recovers after invalid header"})
+                    # A second process must fail at the shared singleton before opening MQTT.
+                    before = broker.connections
+                    duplicate = await asyncio.create_subprocess_exec(
+                        sys.executable, str(ROOT/"server.py"), "--transport", "stdio",
+                        env=env, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    stdout, stderr = await asyncio.wait_for(duplicate.communicate(), 10)
+                    assert duplicate.returncode != 0 and b"already" in stderr.lower(), (stdout, stderr)
+                    assert broker.connections == before and broker.maximum == 1
+                    events.append({"contract":"second HTTP/stdio owner refused before MQTT"})
             proc.terminate()
             proc.wait(timeout=14)
             assert proc.returncode in (0,143,-15), proc.returncode
             return {"seed":seed,"cycles":cycles,"events":events,"max_mqtt_clients":broker.maximum,
-                    "mqtt_connections":broker.connections,"physical_test_commands":len(broker.mutations()),
-                    "transport":"MCP HTTP + paho TLS MQTT", "passed":True}
+                    "mqtt_connections":broker.connections,"simulated_printer_commands":len(broker.mutations()),
+                    "ftps_downloads":ftps.downloads, "camera_captures":camera.captures,
+                    "transport":"MCP HTTP + TLS MQTT/FTPS/camera", "passed":True}
         except BaseException:
             log.flush(); log.seek(0)
             print(log.read()[-10000:], file=sys.stderr)
@@ -355,6 +459,8 @@ async def campaign(seed, cycles):
             if proc.poll() is None:
                 proc.kill(); proc.wait(timeout=5)
             broker.close()
+            ftps.close()
+            camera.close()
             log.close()
 
 if __name__ == "__main__":

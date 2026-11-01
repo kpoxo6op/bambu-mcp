@@ -110,7 +110,7 @@ Before 2026-10-25 it did not exit: bpm's non-daemon MQTT and watchdog threads an
 thread are joined before atexit handlers run, so `_shutdown` never fired and the orphan
 (parent pid 1) kept analysing the camera at about 60% of a core each. A copy started before
 that fix and still running with parent pid 1 is such an orphan and is safe to stop (SIGTERM).
-`test_stdio_exit.py` pins the exit.
+The E2E gate in `harness/run.py` checks process shutdown and exclusive HTTP/stdio ownership.
 
 **A restart, reload, or code redeploy is safe during a print — it never touches the job.**
 The printer runs the job on its own firmware; the daemon only watches and commands it over

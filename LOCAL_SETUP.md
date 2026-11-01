@@ -47,7 +47,8 @@ Camera reads have a deadline and simultaneous one-shot captures are serialized.
 ## Evidence and continuous checks
 
 See [the harness](harness/README.md) for commands and the fault matrix.
-`evidence/harness/latest.json` is the latest verdict. Nightly isolated tests run at
+`evidence/harness/latest.json` is the latest verdict. Only E2E tests run; the old
+unit/mock suites and smoke scripts are removed. Nightly isolated tests run at
 04:30 local time, with bounded duration/resources. Failed seeds are saved and
 replayed before new ones. A failed run stays failed; it is not retried into green.
 The timer records regressions, without automatically changing or deploying code.
@@ -60,11 +61,10 @@ Claude Opus 5.5, high effort, implemented and reviewed the reliability work:
 - `evidence/reliability-20261101/live-acceptance.json`: post-deployment read-only acceptance.
 - `evidence/reliability-20261101/crash-recovery.json`: acceptance after service crash recovery.
 
-The public-path test uses real FastMCP HTTP and real paho TLS MQTT against a fake
-printer in a private network namespace. No fault-injection test reaches the LAN.
+The public-path test uses real FastMCP HTTP, paho TLS MQTT, FTPS and camera clients
+against a protocol simulator in a private network namespace. No fault-injection test reaches the LAN.
 A live check uses `ops/verify_live.py` and the existing HTTP server; it never
-creates another MQTT client or sends a printer write. **Do not use the legacy
-stdio smoke script alongside the shared service.**
+creates another MQTT client or sends a printer write.
 
 ## Recovery and limits
 

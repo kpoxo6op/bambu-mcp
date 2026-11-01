@@ -1,0 +1,156 @@
+"""Network-side FTPS and camera peers for MCP E2E acceptance.
+
+No production classes are imported or mocked. These peers implement the wire
+protocols and can reset a handshake or return an invalid camera header.
+"""
+import io
+import json
+import socket
+import struct
+import threading
+import zipfile
+
+from PIL import Image
+
+
+def project_archive():
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("Metadata/plate_1.json", json.dumps({
+            "bbox_objects":[{"name":"coupon_post.stl"}], "filament_ids":[1]}))
+        z.writestr("Metadata/slice_info.config", '''<config><plate>
+          <metadata key="index" value="1"/><metadata key="filament_maps" value="1"/>
+          <object identify_id="83" name="coupon_post.stl"/>
+          <filament id="1" type="PETG" color="#000000"/></plate></config>''')
+        z.writestr("Metadata/plate_1.gcode", "; CONFIG_BLOCK_START\n; filament_type = PETG\n; CONFIG_BLOCK_END\n")
+    return out.getvalue()  # intentionally no thumbnail or top image
+
+
+class Listener:
+    def __init__(self, ctx, port):
+        self.ctx = ctx
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", port))
+        self.listener.listen()
+        self.listener.settimeout(.2)
+        self.stop = threading.Event()
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while not self.stop.is_set():
+            try:
+                raw, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(raw,), daemon=True).start()
+
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+
+
+class FTPSPeer(Listener):
+    def __init__(self, ctx):
+        self.reset = True
+        self.resets = 0
+        self.downloads = []
+        self.commands = []
+        self.files = {"fixture-job.gcode.3mf":project_archive(), "broken.gcode.3mf":b"broken archive"}
+        super().__init__(ctx, 990)
+
+    def serve(self, raw):
+        passive = None
+        if self.reset:
+            self.resets += 1
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii",1,0))
+            raw.close()
+            return
+        try:
+            raw.settimeout(5)
+            with self.ctx.wrap_socket(raw, server_side=True) as control:
+                stream = control.makefile("rb")
+                def reply(line):
+                    control.sendall((line+"\r\n").encode())
+                reply("220 E2E implicit TLS printer")
+                while not self.stop.is_set():
+                    line = stream.readline(8192).decode().strip()
+                    if not line:
+                        break
+                    verb, _, arg = line.partition(" ")
+                    # Test-only credentials; never record passwords in artifacts.
+                    self.commands.append((verb, "<redacted>" if verb=="PASS" else arg))
+                    if verb=="USER": reply("331 Password required")
+                    elif verb=="PASS": reply("230 Logged in")
+                    elif verb in ("PBSZ","PROT","TYPE","NOOP"): reply("200 OK")
+                    elif verb=="PWD": reply('257 "/"')
+                    elif verb=="CWD": reply("250 Directory changed")
+                    elif verb in ("PASV","EPSV"):
+                        if passive: passive.close()
+                        passive = socket.socket(); passive.bind(("127.0.0.1",0)); passive.listen()
+                        passive.settimeout(5); port=passive.getsockname()[1]
+                        if verb=="PASV": reply(f"227 Entering Passive Mode (127,0,0,1,{port//256},{port%256})")
+                        else: reply(f"229 Entering Extended Passive Mode (|||{port}|)")
+                    elif verb in ("LIST","RETR"):
+                        if verb=="LIST":
+                            data="".join(f"-rw-r--r-- 1 test test {len(v)} Jan 01 2026 {n}\r\n"
+                                         for n,v in self.files.items()).encode()
+                        else:
+                            name=arg.lstrip("/")
+                            if name not in self.files:
+                                reply("550 File not found"); continue
+                            data=self.files[name]; self.downloads.append(name)
+                        reply("150 Opening data connection")
+                        conn,_=passive.accept()
+                        with self.ctx.wrap_socket(conn,server_side=True) as data_socket:
+                            data_socket.sendall(data)
+                            data_socket.unwrap().close()
+                        passive.close(); passive=None
+                        reply("226 Transfer complete")
+                    elif verb=="SIZE":
+                        data=self.files.get(arg.lstrip("/"))
+                        reply("550 File not found" if data is None else f"213 {len(data)}")
+                    elif verb=="QUIT": reply("221 Bye"); break
+                    else: reply("502 Command not implemented")
+        except (OSError,UnicodeError):
+            pass
+        finally:
+            if passive: passive.close()
+            raw.close()
+
+
+class CameraPeer(Listener):
+    def __init__(self, ctx):
+        self.invalid = False
+        self.captures = 0
+        self.authenticated = 0
+        self.frames = []
+        for color in ("red","green"):
+            buf=io.BytesIO(); Image.new("RGB",(32,24),color).save(buf,format="JPEG")
+            self.frames.append(buf.getvalue())
+        super().__init__(ctx,6000)
+
+    def serve(self,raw):
+        try:
+            raw.settimeout(5)
+            with self.ctx.wrap_socket(raw,server_side=True) as peer:
+                auth=b""
+                while len(auth)<80:
+                    part=peer.recv(80-len(auth))
+                    if not part: return
+                    auth+=part
+                if auth[16:48].rstrip(b"\0")!=b"bblp" or auth[48:].rstrip(b"\0")!=b"TESTONLY":
+                    return
+                self.authenticated+=1
+                self.captures+=1
+                if self.invalid:
+                    peer.sendall(struct.pack("<4I",9_000_000,0,1,0))
+                else:
+                    for frame in self.frames:
+                        peer.sendall(struct.pack("<4I",len(frame),0,1,0)+frame)
+        except OSError:
+            pass
+        finally:
+            raw.close()

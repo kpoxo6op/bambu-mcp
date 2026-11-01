@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeatable offline release gate / nightly soak. Never connects to a real printer.
+"""E2E release gate / nightly soak. Never connects to a real printer.
 
 Every test child runs in a fresh network namespace with read-only host files and
 private /tmp + HOME. Bubblewrap failing means the run fails, never falls back.
@@ -19,17 +19,6 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-SUITES = [
-    ["harness/test_watchdog.py"],
-    ["test_reliability.py"],
-    ["-m", "unittest", "-v", "test_local_reliability"],
-    ["test_stdio_exit.py"],
-    ["test_session_config_env.py"],
-    ["test_external_spool_tools.py"],
-    ["test_print_file_ams_mapping.py"],
-    ["test_camera_defects.py"],
-    ["test_tool_annotations.py"],
-]
 
 FREEZE = """
 import hashlib, importlib.metadata as m, json
@@ -61,7 +50,8 @@ def source_hash():
 def run_child(args, python, log, timeout):
     env = {"PATH":"/usr/local/bin:/usr/bin:/bin", "LANG":"C.UTF-8",
            "PYTHONDONTWRITEBYTECODE":"1", "PYTHONUNBUFFERED":"1"}
-    cmd = ["/usr/bin/bwrap", "--unshare-net", "--unshare-pid", "--die-with-parent",
+    cmd = ["/usr/bin/bwrap", "--unshare-user", "--uid", "0", "--gid", "0",
+           "--cap-add", "CAP_NET_BIND_SERVICE", "--unshare-net", "--unshare-pid", "--die-with-parent",
            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
            "--dir", "/tmp/home", "--setenv", "HOME", "/tmp/home",
            "--setenv", "XDG_CONFIG_HOME", "/tmp/home/.config",
@@ -85,7 +75,6 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--cycles", type=int, default=8)
     ap.add_argument("--seed", type=int)
-    ap.add_argument("--wire-only", action="store_true")
     ap.add_argument("--python", type=Path, default=ROOT/".venv-candidate/bin/python")
     ap.add_argument("--output", type=Path, default=ROOT/"evidence/harness")
     args = ap.parse_args()
@@ -115,9 +104,8 @@ def main():
         corpus = json.loads(corpus_file.read_text())
     except (OSError,ValueError):
         corpus = []
-    jobs = [] if args.wire_only else list(SUITES)
     seeds = list(dict.fromkeys(corpus+[seed+i for i in range(args.rounds)]))
-    jobs += [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
+    jobs = [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
     for i, cmd in enumerate(jobs):
         result = run_child(cmd, args.python, run/f"{i:02}.log", max(90, args.cycles*12))
         report["results"].append(result)
