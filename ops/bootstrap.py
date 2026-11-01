@@ -28,6 +28,9 @@ def main():
     if not target.exists():
         venv.EnvBuilder(with_pip=True).create(target)
     python = target / "bin/python"
+    if subprocess.run([str(python), "-m", "pip", "--version"], capture_output=True).returncode != 0:
+        # An environment created by uv (or `venv --without-pip`) has no pip yet.
+        subprocess.run([str(python), "-m", "ensurepip", "--upgrade"], check=True)
     install = [str(python), "-m", "pip", "install", "--disable-pip-version-check"]
     subprocess.run(install + ["-r", str(ROOT / "installed-requirements.txt")], check=True)
     # The patched BPM comes only from vendor/; its +bambumcp local version is never on PyPI,
