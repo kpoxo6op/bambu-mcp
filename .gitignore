@@ -5,6 +5,10 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv*/
+/evidence/
+*.env
+!*.env.example
 *.enc
 config/settings.toml
 config/claude_desktop.json

@@ -1,0 +1,321 @@
+"""
+Based on: <https://github.com/dgonzo27/py-iot-utils>
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+wrapper for FTPS server interactions
+"""
+
+import dataclasses
+import datetime
+import ftplib
+import io
+import logging
+import os
+import re
+import socket
+import ssl
+
+logger = logging.getLogger(__name__)
+
+
+FTP_LIST_PATTERN = re.compile(
+    r"(?P<directory>[d-])(?P<permissions>(?:[r-][w-][x-]){3})\s+\d+\s+(?P<owner>\w+)\s+(?P<group>\w+)\s+(?P<size>\d+)\s+(?:(?P<date>(?P<month>\w{3})\s+(?P<day>\d{2}))\s+(?:(?P<year>\d{4})|(?P<time>(?P<hour>\d{2}):(?P<minute>\d{2}))))\s+(?P<name>.*)"
+)
+MONTH_LOOKUP = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+
+@dataclasses.dataclass
+class FtpListItem:
+    path: str
+    name: str
+    size: int
+    is_dir: bool
+    timestamp: datetime.datetime
+    owner: str
+    group: str
+    permissions: str
+
+
+class ImplicitTLS(ftplib.FTP_TLS):
+    """ftplib.FTP_TLS sub-class to support implicit SSL FTPS"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sock = None
+
+    @property
+    def sock(self):
+        """return socket"""
+        return self._sock
+
+    @sock.setter
+    def sock(self, value):
+        """wrap and set SSL socket"""
+        if value is not None and not isinstance(value, ssl.SSLSocket):
+            value = self.context.wrap_socket(value)
+        self._sock = value
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+
+        if self._prot_p:
+            conn = self.context.wrap_socket(
+                conn, server_hostname=self.host, session=self.sock.session
+            )  # this is the fix
+        return conn, size
+
+
+class IoTFTPSClient:
+    """iot ftps ftpsclient"""
+
+    ftps_host: str
+    ftps_port: int
+    ftps_user: str
+    ftps_pass: str
+    ssl_implicit: bool
+    ftps_session: ftplib.FTP | ImplicitTLS
+    last_error: str | None = None
+    welcome: str
+
+    def __init__(
+        self,
+        ftps_host: str,
+        ftps_port: int | None = 21,
+        ftps_user: str | None = "",
+        ftps_pass: str | None = "",
+        ssl_implicit: bool | None = False,
+        timeout: float | None = 15,
+    ) -> None:
+        self.ftps_host = ftps_host
+        self.ftps_port = ftps_port
+        self.ftps_user = ftps_user
+        self.ftps_pass = ftps_pass
+        self.ssl_implicit = ssl_implicit
+        self.timeout = timeout
+        self.instantiate_ftps_session()
+
+    def __repr__(self) -> str:
+        return (
+            "IoT FTPS Client\n"
+            "--------------------\n"
+            f"host: {self.ftps_host}\n"
+            f"port: {self.ftps_port}\n"
+            f"user: {self.ftps_user}\n"
+            f"ssl: {self.ssl_implicit}"
+        )
+
+    def instantiate_ftps_session(self) -> None:
+        """init ftps_session based on input params"""
+        self.ftps_session = ImplicitTLS() if self.ssl_implicit else ftplib.FTP()
+        self.ftps_session.set_debuglevel(0)
+
+        try:
+            # Bound the control-connection attempt: without an explicit timeout,
+            # ftplib falls back to the socket default (None → block forever), so
+            # an unreachable/half-open printer FTPS port would hang the caller
+            # indefinitely instead of raising.
+            self.welcome = self.ftps_session.connect(
+                host=self.ftps_host, port=self.ftps_port, timeout=self.timeout
+            )
+
+            if self.ftps_user and self.ftps_pass:
+                self.ftps_session.login(user=self.ftps_user, passwd=self.ftps_pass)
+            else:
+                self.ftps_session.login()
+
+            if self.ssl_implicit:
+                self.ftps_session.prot_p()
+        except Exception:
+            # Recovery: a failed/timed-out setup would otherwise leak the
+            # half-open socket (the caller never receives the object to close).
+            # Tear the session down, then re-raise so the caller can handle it.
+            try:
+                self.ftps_session.close()
+            except Exception:
+                pass
+            raise
+
+    def disconnect(self) -> None:
+        """disconnect the current session from the ftps server"""
+        self.ftps_session.close()
+
+    def download_file(self, source: str, dest: str):
+        """download a file to a path on the local filesystem"""
+        with open(dest, "wb") as file:
+            self.ftps_session.retrbinary(f"RETR {source}", file.write)
+
+    def upload_file(self, source: str, dest: str, callback=None):
+        """upload a file to a path inside the FTPS server"""
+
+        file_size = os.path.getsize(source)
+
+        block_size = max(file_size // 100, 8192)
+        rest = None
+
+        # Taken from ftplib.storbinary but with custom ssl handling
+        # due to the shitty bambu p1p ftps server TODO fix properly.
+        with open(source, "rb") as fp:
+            self.ftps_session.voidcmd("TYPE I")
+
+            with self.ftps_session.transfercmd(f"STOR {dest}", rest) as conn:
+                while 1:
+                    buf = fp.read(block_size)
+
+                    if not buf:
+                        break
+
+                    conn.sendall(buf)
+
+                    if callback:
+                        callback(buf)
+
+                # shutdown ssl layer
+                if ftplib._SSLSocket is not None and isinstance(
+                    conn, ftplib._SSLSocket
+                ):
+                    # Yeah this is suposed to be conn.unwrap
+                    # But since we operate in prot p mode
+                    # we can close the connection always.
+                    # This is cursed but it works.
+                    if "vsFTPd" in self.welcome:
+                        conn.unwrap()
+                    else:
+                        conn.shutdown(socket.SHUT_RDWR)
+
+            return self.ftps_session.voidresp()
+
+            # Old api call.
+            # self.ftps_session.storbinary(
+            #    f"STOR {dest}", file, blocksize=block_size, callback=callback)
+
+    def delete_file(self, path: str):
+        """delete a file from under a path inside the FTPS server"""
+        self.ftps_session.delete(path)
+
+    def delete_folder(self, path: str):
+        """delete a folder inside the FTPS server"""
+        self.ftps_session.rmd(path)
+
+    def move_file(self, source: str, dest: str):
+        """move a file inside the FTPS server to another path inside the FTPS server"""
+        self.ftps_session.rename(source, dest)
+
+    def mkdir(self, path: str) -> str:
+        return self.ftps_session.mkd(path)
+
+    def fexists(self, path: str) -> bool:
+        size = 0
+        try:
+            size = self.ftps_session.size(path)
+        except Exception:
+            size = 0
+        return size > 0
+
+    def list_files(self, path: str = "/") -> None:
+        """list files under a path inside the FTPS server"""
+        return self.ftps_session.dir(path, print)
+
+    def list_files_ex(self, path: str) -> list[FtpListItem] | None:
+        """
+        list files under a path inside the FTPS server
+
+        Returns a list of entries, which is empty when the folder is empty or the printer
+        refuses or does not have the path, and `None` when the listing itself failed (a
+        timeout, a dropped connection, any other error), so a failed listing is never
+        mistaken for an empty folder.
+        """
+        try:
+            lines: list[str] = []
+            self.ftps_session.dir(path, lines.append)
+            s = "\n".join(lines)
+        except ftplib.error_perm:
+            # no permission for this path
+            return []
+        except Exception:
+            logger.exception("Unexpected exception occurred while fetching file list")
+            return None
+
+        files = []
+        for row in s.split("\n"):
+            try:
+                if len(row) <= 0:
+                    continue
+
+                match = FTP_LIST_PATTERN.fullmatch(row)
+                if not match:
+                    continue
+
+                month = MONTH_LOOKUP.get(match.group("month"))
+                if month is None:
+                    # invalid month
+                    continue
+
+                if match.group("year"):  # "Nov 11 2025"
+                    date = datetime.datetime(
+                        int(match.group("year")), month, int(match.group("day"))
+                    )
+                else:  # "Nov 11 18:19"
+                    today = datetime.datetime.today().astimezone(datetime.timezone.utc)
+                    date = datetime.datetime(
+                        today.year,
+                        month,
+                        int(match.group("day")),
+                        hour=int(match.group("hour")),
+                        minute=int(match.group("minute")),
+                        tzinfo=datetime.timezone.utc,
+                    )
+                    if date > today:
+                        date = (date + datetime.timedelta(days=-365))
+
+                prefix = "" if path == "/" else path
+                name = match.group("name")
+                size = int(match.group("size"))
+
+                files.append(
+                    FtpListItem(
+                        path=f"{prefix}/{name}",
+                        name=name,
+                        size=size,
+                        is_dir=match.group("directory") == "d",
+                        timestamp=date,
+                        owner=match.group("owner"),
+                        group=match.group("group"),
+                        permissions=match.group("permissions"),
+                    )
+                )
+            except Exception:
+                logger.exception(f"Unexpected error while parsing listing row: {row}")
+
+        return files

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["bambu_mcp.egg-info*", "*.egg-info"]
+exclude = ["bambu_mcp.egg-info*", "*.egg-info", "vendor*"]
 
 [project]
 name = "bambu-mcp"
@@ -18,7 +18,7 @@ dependencies = [
     "pillow",
     "numpy",
     "matplotlib>=3.9",
-    "bambu-printer-manager @ file:///home/boris/.local/share/bambu-printer-manager",
+    "bambu-printer-manager==2.0.0rc2",
     "flask>=3.0",
     "flask-cors>=4.0",
     "zeroconf>=0.131",

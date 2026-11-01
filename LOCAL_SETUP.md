@@ -2,7 +2,8 @@
 
 Based on `synman/bambu-mcp` v0.9.0, commit
 `7001c3b79e53d8a215223026db44fc4f0577fde2`, branch `platt-local`.
-This is a locally maintained installation. Preserve its changes on upgrades.
+Published fork: https://github.com/kpoxo6op/bambu-mcp.
+See `docs/recovery.md` for a rebuild on another machine.
 
 ## Runtime
 
@@ -37,8 +38,8 @@ replayed after reconnect. Read-only state refreshes may repeat.
 
 The 3MF parser also accepts valid sliced projects without preview PNGs. The patch
 is `patches/bpm-optional-thumbnails.patch`, based on BPM commit
-`728551cde926e8e3b4506c37dbaf722b30b98a70`. Source lives in the sibling
-`bambu-printer-manager` checkout; pyproject points there. The candidate environment
+`728551cde926e8e3b4506c37dbaf722b30b98a70`. The recoverable source snapshot is in
+`vendor/bambu-printer-manager`; `ops/bootstrap.py` installs it before the MCP package. The candidate environment
 is `.venv-candidate`; `installed-requirements.txt` records installed versions.
 External-spool loading accepts tray254 without requiring an AMS. Print submission
 verifies plate metadata and rechecks active printing/filament change before send.
@@ -86,5 +87,5 @@ Bambu Studio still consume printer connection slots. Coalesced update callbacks
 can merge very short state transitions. The thresholds and offline fault corpus
 remain explicit in code and reports and should evolve with observed failures.
 
-Private evidence includes configuration backups and raw review transcripts.
+Historical private evidence includes configuration backups and raw review transcripts.
 Do not publish or commit that directory. No credentials belong in Git.

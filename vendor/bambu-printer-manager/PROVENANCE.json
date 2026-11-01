@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/synman/bambu-printer-manager",
+  "base_commit": "728551cde926e8e3b4506c37dbaf722b30b98a70",
+  "local_changes": [
+    "Optional 3MF preview images",
+    "Generated MCP documentation for the reliability tools"
+  ]
+}

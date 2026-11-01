@@ -3,8 +3,8 @@ Description=Offline Bambu MCP regression and transport fault campaign
 
 [Service]
 Type=oneshot
-ExecStart=/home/boris/.local/share/bambu-mcp/.venv-candidate/bin/python /home/boris/.local/share/bambu-mcp/harness/run.py --rounds 20 --cycles 12
-WorkingDirectory=/home/boris/.local/share/bambu-mcp
+ExecStart=%h/.local/share/bambu-mcp/.venv-candidate/bin/python %h/.local/share/bambu-mcp/harness/run.py --rounds 20 --cycles 12
+WorkingDirectory=%h/.local/share/bambu-mcp
 TimeoutStartSec=30min
 KillMode=control-group
 Nice=10

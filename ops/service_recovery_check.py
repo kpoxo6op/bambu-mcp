@@ -57,6 +57,7 @@ async def main():
                     "recovery_seconds":round(time.monotonic()-started,2),"before":before,"after":after,
                     "health":health,"time":time.strftime("%Y-%m-%dT%H:%M:%S%z")}
             out=Path(__file__).resolve().parents[1]/"evidence/reliability-20261101/crash-recovery.json"
+            out.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
             out.write_text(json.dumps(report,indent=2))
             print(json.dumps({k:report[k] for k in ("passed","same_mcp_client","recovery_seconds","after")}))
 

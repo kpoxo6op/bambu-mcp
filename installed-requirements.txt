@@ -1,10 +1,9 @@
+# Runtime dependencies; local projects are installed by ops/bootstrap.py.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 attrs==26.1.0
 av==19.0.2
--e file:///home/boris/.local/share/bambu-mcp
-bambu-printer-manager @ file:///home/boris/.local/share/bambu-printer-manager
 blinker==1.9.0
 certifi==2026.10.23
 cffi==2.1.1

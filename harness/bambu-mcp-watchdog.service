@@ -3,8 +3,8 @@ Description=Probe shared Bambu MCP and recover a hung service
 
 [Service]
 Type=oneshot
-ExecStart=/home/boris/.local/share/bambu-mcp/.venv-candidate/bin/python /home/boris/.local/share/bambu-mcp/harness/watchdog.py
-WorkingDirectory=/home/boris/.local/share/bambu-mcp
+ExecStart=%h/.local/share/bambu-mcp/.venv-candidate/bin/python %h/.local/share/bambu-mcp/harness/watchdog.py
+WorkingDirectory=%h/.local/share/bambu-mcp
 TimeoutStartSec=25
 UMask=0077
 NoNewPrivileges=true

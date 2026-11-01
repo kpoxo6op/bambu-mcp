@@ -5,8 +5,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/boris/.local/share/bambu-mcp/launch.py --http
-WorkingDirectory=/home/boris/.local/share/bambu-mcp
+EnvironmentFile=%h/.config/bambu-mcp/printer.env
+ExecStart=/usr/bin/python3 %h/.local/share/bambu-mcp/launch.py --http
+WorkingDirectory=%h/.local/share/bambu-mcp
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
