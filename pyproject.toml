@@ -18,7 +18,7 @@ dependencies = [
     "pillow",
     "numpy",
     "matplotlib>=3.9",
-    "bambu-printer-manager==2.0.0rc2",
+    "bambu-printer-manager==2.0.0rc2+bambumcp.1",  # vendor/bambu-printer-manager only; never on PyPI
     "flask>=3.0",
     "flask-cors>=4.0",
     "zeroconf>=0.131",

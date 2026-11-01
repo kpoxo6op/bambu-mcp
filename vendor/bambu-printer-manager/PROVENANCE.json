@@ -1,8 +1,10 @@
 {
   "upstream": "https://github.com/synman/bambu-printer-manager",
   "base_commit": "728551cde926e8e3b4506c37dbaf722b30b98a70",
+  "version": "2.0.0rc2+bambumcp.1",
   "local_changes": [
-    "Optional 3MF preview images",
-    "Generated MCP documentation for the reliability tools"
+    "Optional 3MF preview images (patches/bpm-optional-thumbnails.patch, src/bpm/bambuproject.py only)",
+    "Generated MCP documentation for the reliability tools (docs/bambu-mcp/)",
+    "Local version label +bambumcp.1 so an upstream or PyPI 2.0.0rc2 can never satisfy the MCP pin"
   ]
 }

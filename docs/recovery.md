@@ -66,4 +66,12 @@ logs, Studio files, credentials and local evidence are excluded from Git.
 
 Keep a working checkout and environment until the replacement passes E2E. The
 bootstrap script refuses to overwrite an existing environment; create a separate
-checkout or use `--venv /path/to/new-environment` for a trial rebuild.
+checkout or use `--venv /path/to/new-environment` for a trial rebuild. After a
+change to `vendor/` or the pins, refresh the live environment with
+`python3.14 ops/bootstrap.py --reuse` (copy `.venv-candidate` first for rollback),
+then restart `bambu-mcp.service`. `python make.py` runs the same bootstrap.
+
+The patched printer library is versioned `2.0.0rc2+bambumcp.1`. Local version
+labels cannot be published to PyPI, so the MCP's exact pin can only be satisfied
+by `vendor/bambu-printer-manager`; a plain `pip install -e .` in a fresh
+environment fails instead of silently installing an unpatched upstream build.

@@ -12,24 +12,30 @@ concurrency:
   cancel-in-progress: true
 jobs:
   isolated-printer:
+    # 22.04: unprivileged user namespaces for bubblewrap work without an AppArmor override.
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to release commits (Node 24 majors); the tag is in the comment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
       - name: Install network isolation tools
         run: sudo apt-get update && sudo apt-get install -y bubblewrap openssl
       - name: Rebuild from repository only
         run: python ops/bootstrap.py
+      - name: Generated tool documentation is current
+        run: |
+          .venv-candidate/bin/python gen_docs.py
+          git diff --exit-code -- README.md vendor/bambu-printer-manager/docs/bambu-mcp
       - name: Run E2E workflows and network faults
         run: .venv-candidate/bin/python harness/run.py --rounds 3 --cycles 8
       - name: Save reports and replay seeds
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-report
           path: evidence/harness/
