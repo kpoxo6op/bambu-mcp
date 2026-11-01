@@ -192,7 +192,9 @@ session kept recent_update True and served a pre-job IDLE frame while the printe
 ``live`` / ``telemetry`` are the authoritative freshness answer (reliability.health):
 ``telemetry.status`` is one of live, starting, incomplete, stale, disconnected, recovering,
 stuck, paused, not_connected, unknown, with ``reason``, ``age_s`` (last_received,
-last_telemetry, last_usable, baseline, connected_for, in_callback_for), message counters, restarts and
+last_telemetry, last_usable, baseline, connected_for, in_callback_for), message counters, restarts,
+``connect_error`` (why the latest connection attempt failed: printer unreachable, connection
+refused, or "Not authorized" for a rejected LAN access code; None once connected) and
 ``writable``. Printer writes are refused unless ``writable`` is True; state tools return
 ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
 

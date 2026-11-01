@@ -229,6 +229,9 @@ class ReliablePrinter(BambuPrinter):
         self._rel_processed = 0
         self._rel_failed = 0
         self._rel_last_error: str | None = None
+        # Why the latest connection attempt failed (refused, unreachable, not authorized).
+        # Kept apart from last_error, which the disconnect that follows a refusal overwrites.
+        self._rel_connect_error: str | None = None
         self._rel_last_pushall_req = 0.0
 
     def _rel_mark_incomplete(self, why: str) -> None:
@@ -323,12 +326,21 @@ class ReliablePrinter(BambuPrinter):
         def on_connect(client, userdata, flags, reason_code, properties):
             original(client, userdata, flags, reason_code, properties)
             if getattr(reason_code, "is_failure", False):
+                # bpm labels the session CONNECTED even on a refused CONNACK; health does not.
+                # Credentials are read when a session is built, so a changed code needs a restart.
+                self._rel_set_connect_error(
+                    f"printer refused the MQTT connection: {reason_code} (if the LAN access code "
+                    "changed, update it in Bambu Studio, then restart bambu-mcp.service)")
                 return
             with self._rel_lock:
+                down_since = self._rel_disconnected_at
+                self._rel_connect_error = None
                 self._rel_connected_at = time.monotonic()
                 self._rel_disconnected_at = None
                 self._rel_covered = set()
                 self._rel_baseline_at = None
+            if down_since is not None:
+                log.warning("ReliablePrinter: MQTT reconnected after %.0fs", time.monotonic() - down_since)
             if self.service_state != ServiceState.PAUSED:
                 self._request_pushall(client)
         return on_connect
@@ -336,13 +348,24 @@ class ReliablePrinter(BambuPrinter):
     def _wrap_on_disconnect(self, original):
         def on_disconnect(client, userdata, flags, reason_code, properties):
             with self._rel_lock:
+                was_connected = self._rel_connected_at is not None
                 self._rel_connected_at = None
                 self._rel_disconnected_at = time.monotonic()
                 self._rel_covered = set()
                 self._rel_baseline_at = None
                 self._rel_last_error = f"mqtt disconnected: {reason_code}"
+            if was_connected:  # once per lost connection, not per failed retry
+                log.warning("ReliablePrinter: MQTT disconnected (%s); telemetry not live until it reconnects",
+                            reason_code)
             original(client, userdata, flags, reason_code, properties)
         return on_disconnect
+
+    def _rel_set_connect_error(self, message: str) -> None:
+        with self._rel_lock:
+            changed = message != self._rel_connect_error
+            self._rel_connect_error = message
+        if changed:  # each distinct cause once, not every reconnect attempt
+            log.warning("ReliablePrinter: %s", message)
 
     def _request_pushall(self, client=None) -> bool:
         """Read-only full-state request. Safe to repeat; never a printer write."""
@@ -421,6 +444,10 @@ class ReliablePrinter(BambuPrinter):
                 target=self._rel_worker, name=f"bambu-callbacks-{self.config.serial_number[-4:]}", daemon=True)
             self._rel_worker_thread.start()
         super().start_session()
+        if self.service_state == ServiceState.QUIT and self._internalException is not None:
+            # bpm's synchronous first connect failed (printer off, unreachable, TLS reset).
+            exc = self._internalException
+            self._rel_set_connect_error(f"cannot connect to the printer: {type(exc).__name__}: {exc}")
         real = self._client
         if real is not None:
             try:
@@ -428,6 +455,11 @@ class ReliablePrinter(BambuPrinter):
                 real.reconnect_delay_set(min_delay=1, max_delay=30)
             except Exception:
                 pass
+
+            def on_connect_fail(client, userdata):
+                # paho's own reconnect raised OSError (no route, refused, TLS reset, timeout).
+                self._rel_set_connect_error("cannot reach the printer (reconnect attempt failed)")
+            real.on_connect_fail = on_connect_fail
 
     def quit(self, timeout: float | None = None) -> bool:
         """bpm quit() bounded. Returns False when bpm's threads did not stop in time."""
@@ -552,8 +584,10 @@ class ReliablePrinter(BambuPrinter):
                 "messages": {"received": self._rel_received, "processed": self._rel_processed,
                              "failed": self._rel_failed},
                 "last_error": self._rel_last_error,
+                "connect_error": self._rel_connect_error,
                 "session_generation": self._rel_generation,
             }
+            connect_error = self._rel_connect_error
         thread = self._mqtt_client_thread
         alive = bool(thread and thread.is_alive())
         real = self._client
@@ -574,12 +608,15 @@ class ReliablePrinter(BambuPrinter):
         elif not alive and not self.session_dead():
             status, reason = "starting", "session starting; state unknown"
         elif not alive:
-            status, reason = "disconnected", self._rel_last_error or "MQTT loop thread is not running"
+            status, reason = "disconnected", (connect_error or self._rel_last_error
+                                              or "MQTT loop thread is not running")
         elif not mqtt_connected or connected_at is None:
-            if self._rel_received == 0 and self._rel_disconnected_at is None:
+            if self._rel_received == 0 and self._rel_disconnected_at is None and not connect_error:
                 status, reason = "starting", "connecting; state unknown"
             else:
-                status, reason = "disconnected", "MQTT reconnecting"
+                status, reason = "disconnected", "MQTT reconnecting" + (
+                    f"; last attempt: {connect_error}" if connect_error
+                    else f"; {self._rel_last_error}" if self._rel_last_error else "")
         elif baseline is None:
             if self._rel_failed and self._rel_last_error and "processing failed" in self._rel_last_error:
                 status, reason = "incomplete", self._rel_last_error

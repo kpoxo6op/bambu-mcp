@@ -341,6 +341,9 @@ def main() -> None:
         # HTTP session ID dies with the process and leaves clients receiving 404 forever.
         # Printer state/sessions already live in the global manager, not HTTP sessions.
         mcp.settings.stateless_http = True
+        # uvicorn logs every request at INFO; the 30 s watchdog alone made that 97% of the
+        # journal and buried the supervisor's recovery warnings.
+        mcp.settings.log_level = "WARNING"
         # Run startup in a background thread — printer SSL handshakes can block
         # for 30+ seconds, exceeding the daemon script's port-file wait window.
         threading.Thread(target=_startup, daemon=True, name="bambu-mcp-startup").start()

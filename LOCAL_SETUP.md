@@ -21,7 +21,9 @@ service. Printer-offline status is not itself a reason to restart the service.
 Credentials are not copied into MCP configuration. The endpoint is loopback only,
 with SDK Host/Origin checks; it is not authenticated against other local processes.
 Runtime files are private. Logs rotate at 10 MB with three backups in
-`~/.bambu-mcp/bambu-mcp.log`; recovery warnings also reach the systemd journal.
+`~/.bambu-mcp/bambu-mcp.log`; warnings (disconnects, reconnects, connection
+causes, supervisor restarts) also reach the systemd journal. Per-request HTTP
+access lines are suppressed so the 30 s watchdog does not bury them.
 
 ## Incident and repair
 
