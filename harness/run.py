@@ -47,12 +47,32 @@ def source_hash():
         h.update(str(p.relative_to(ROOT)).encode()); h.update(p.read_bytes())
     return h.hexdigest()
 
+def interpreter_dirs(python):
+    """Directories the test interpreter needs that may sit under the hidden home directory."""
+    out = subprocess.run([str(python), "-I", "-c", "import sys; print(sys.base_prefix)"],
+                         capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+    venv_dir = Path(os.path.abspath(python)).parent.parent
+    dirs = {Path(out), Path(out).resolve(), Path(python).resolve().parent.parent, venv_dir.resolve()}
+    cfg = Path(python).parent.parent / "pyvenv.cfg"
+    for line in cfg.read_text().splitlines() if cfg.exists() else []:
+        key, _, value = line.partition("=")
+        if key.strip() == "home":
+            dirs |= {Path(value.strip()).parent, Path(value.strip()).resolve().parent}
+    return sorted(d for d in dirs if d.is_dir())
+
 def run_child(args, python, log, timeout):
     env = {"PATH":"/usr/local/bin:/usr/bin:/bin", "LANG":"C.UTF-8",
            "PYTHONDONTWRITEBYTECODE":"1", "PYTHONUNBUFFERED":"1"}
+    # The real home directory (Bambu Studio's LAN access code, printer.env, MCP configs) and
+    # the private evidence directory are hidden; only the checkout and interpreter come back.
+    hide = ["--tmpfs", str(Path.home())]
+    for d in [ROOT, *interpreter_dirs(python)]:
+        hide += ["--ro-bind", str(d), str(d)]
+    if (ROOT/"evidence").is_dir():
+        hide += ["--tmpfs", str(ROOT/"evidence")]
     cmd = ["/usr/bin/bwrap", "--unshare-user", "--uid", "0", "--gid", "0",
            "--cap-add", "CAP_NET_BIND_SERVICE", "--unshare-net", "--unshare-pid", "--die-with-parent",
-           "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+           "--ro-bind", "/", "/", *hide, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
            "--dir", "/tmp/home", "--setenv", "HOME", "/tmp/home",
            "--setenv", "XDG_CONFIG_HOME", "/tmp/home/.config",
            "--setenv", "XDG_CACHE_HOME", "/tmp/home/.cache",

@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,22 @@ def packet(kind, data):
         if not n:
             break
     return bytes([kind]) + length + data
+
+def held_mqtt_sockets():
+    """Client-side TCP sockets to the MQTT port that are still open in this network namespace.
+
+    ESTABLISHED, or CLOSE_WAIT: the peer closed but the client never closed its socket (the
+    2026-11-01 leak). The broker's own ends (local port 8883) are not counted.
+    """
+    held = 0
+    with open("/proc/net/tcp") as f:
+        next(f)
+        for line in f:
+            _, local, remote, state = line.split()[:4]
+            if int(remote.rsplit(":", 1)[1], 16) == 8883 and int(local.rsplit(":", 1)[1], 16) != 8883 \
+                    and state in ("01", "08"):
+                held += 1
+    return held
 
 def exact(sock, n):
     data = b""
@@ -68,6 +85,14 @@ class Broker:
         self.reports = False
         self.running = False
         self.block_reads = False
+        # normal | refuse (TCP reset at accept: printer off or unreachable) |
+        # unauthorized (CONNACK 5: wrong LAN access code)
+        self.mode = "normal"
+        self.attempts = 0
+        self.refusals = 0
+        # Peers whose link went dead: never read from or written to again, no PINGRESP.
+        self.blackholed = set()
+        self.held_max = 0
         self.stop = threading.Event()
         threading.Thread(target=self.accept, daemon=True).start()
 
@@ -102,8 +127,25 @@ class Broker:
             except OSError:
                 pass
 
+    def sample_held(self):
+        self.held_max = max(self.held_max, held_mqtt_sockets())
+        return self.held_max
+
+    def blackhole(self):
+        """The current link dies silently: no FIN/RST, no data and no PINGRESP from the printer."""
+        with self.lock:
+            dead = set(self.peers)
+            self.blackholed |= dead
+            self.peers -= dead
+
     def serve(self, raw):
         peer = None
+        self.attempts += 1
+        if self.mode == "refuse":
+            self.refusals += 1
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            raw.close()
+            return
         try:
             raw.settimeout(3)
             peer = self.ctx.wrap_socket(raw, server_side=True)
@@ -111,10 +153,11 @@ class Broker:
             self.peers.add(peer)
             self.connections += 1
             self.maximum = max(self.maximum, len(self.peers))
+            self.sample_held()
             def read(n):
                 data = b""
                 while len(data)<n:
-                    while self.block_reads and not self.stop.is_set():
+                    while (self.block_reads or peer in self.blackholed) and not self.stop.is_set():
                         time.sleep(.01)
                     chunk = peer.recv(min(16384,n-len(data)))
                     if not chunk:
@@ -132,6 +175,10 @@ class Broker:
                     scale *= 128
                 body = read(length)
                 typ = header >> 4
+                if typ == 1 and self.mode == "unauthorized":
+                    self.refusals += 1
+                    self.send(peer, b"\x20\x02\x00\x05")  # CONNACK: not authorized
+                    break
                 if typ == 1:
                     self.send(peer, b"\x20\x02\x00\x00")
                 elif typ == 8:
@@ -153,6 +200,7 @@ class Broker:
         finally:
             if peer:
                 self.peers.discard(peer)
+                self.blackholed.discard(peer)
                 peer.close()
             else:
                 raw.close()
@@ -199,6 +247,7 @@ async def campaign(seed, cycles):
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         broker = Broker(tmp)
+        broker.mode = "refuse"  # the printer is off when the server starts
         ftps = FTPSPeer(broker.ctx)
         camera = CameraPeer(broker.ctx)
         studio = tmp / "BambuStudio.conf"
@@ -222,7 +271,9 @@ async def campaign(seed, cycles):
                     probe.close(); break
                 except OSError:
                     await asyncio.sleep(.1)
-            async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp") as (rd, wr, _):
+            url = f"http://127.0.0.1:{port}/mcp"
+            from watchdog import probe as watchdog_probe
+            async with streamablehttp_client(url) as (rd, wr, _):
                 async with ClientSession(rd, wr) as c:
                     await c.initialize()
                     names = {t.name for t in (await c.list_tools()).tools}
@@ -237,6 +288,48 @@ async def campaign(seed, cycles):
                                 return time.monotonic()-start
                             await asyncio.sleep(.1)
                         raise AssertionError(f"not live: {h}")
+                    async def health_until(predicate, what, timeout=10.):
+                        start = time.monotonic()
+                        while True:
+                            h = (await call("get_printer_connection_status"))["telemetry"]
+                            if predicate(h):
+                                return h
+                            if time.monotonic() - start > timeout:
+                                raise AssertionError(f"{what}: {h}")
+                            await asyncio.sleep(.1)
+                    async def released_dead_socket():
+                        # A refused reconnect can be ESTABLISHED for an instant; a leaked socket stays.
+                        for _ in range(40):
+                            if held_mqtt_sockets() == 0:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError(f"MCP still holds {held_mqtt_sockets()} MQTT socket(s) to a dead link")
+                    async def refuses_writes():
+                        refused = await call("set_bed_temp", temp=0, user_permission=True)
+                        assert "telemetry_not_live" in str(refused), refused
+                    # Printer off or unreachable when the server starts. The status must name the
+                    # cause, writes are refused, reconnects back off instead of storming, and the
+                    # MCP process itself answers the external watchdog as healthy.
+                    offline = await health_until(lambda h: "cannot connect" in str(h.get("reason")),
+                                                 "offline cause not reported")
+                    assert not offline["live"] and not offline["writable"], offline
+                    attempts, t0 = broker.attempts, time.monotonic()
+                    await asyncio.sleep(2)
+                    retries = broker.attempts - attempts
+                    assert 1 <= retries <= 12, f"{retries} connection attempts in {time.monotonic()-t0:.1f}s"
+                    assert (await watchdog_probe(url, "fixture"))["live"] is False
+                    await refuses_writes()
+                    events.append({"contract":"printer offline at server start: cause reported, writes "
+                                   "refused, bounded retries, MCP healthy", "retries_in_2s":retries, "sent":0})
+                    # Reachable, but the LAN access code is rejected (CONNACK 5).
+                    broker.mode = "unauthorized"
+                    denied = await health_until(lambda h: "not authorized" in str(h.get("reason")).lower(),
+                                                "access-code refusal not reported")
+                    assert not denied["writable"], denied
+                    await refuses_writes()
+                    assert broker.refusals and not broker.mutations(), broker.mutations()
+                    events.append({"contract":"rejected access code reported as such, writes refused", "sent":0})
+                    broker.mode = "normal"
                     starting = await call("get_print_progress")
                     assert starting.get("error") == "telemetry_not_live", starting
                     refused = await call("set_bed_temp", temp=0, user_permission=True)
@@ -246,8 +339,7 @@ async def campaign(seed, cycles):
                     broker.reports = True
                     broker.broadcast()
                     await until_live()
-                    from watchdog import probe as watchdog_probe
-                    assert (await watchdog_probe(f"http://127.0.0.1:{port}/mcp", "fixture"))["live"]
+                    assert (await watchdog_probe(url, "fixture"))["live"]
                     # One authorized test mutation must arrive once over the real wire.
                     sent = await call("set_bed_temp", temp=0, user_permission=True)
                     assert "acceptance is not confirmed" in str(sent), sent
@@ -294,6 +386,7 @@ async def campaign(seed, cycles):
                         await asyncio.sleep(.1)
                         assert len(broker.mutations()) == before, broker.mutations()
                         assert broker.maximum == 1, broker.maximum
+                        assert broker.sample_held() <= 1, ("MQTT sockets held", broker.held_max)
                         # A drop needs a new connection; the others must be survived by the same
                         # paho loop (a parse error or FTPS reset that killed it would reconnect).
                         assert (broker.connections > connections if fault == "drop"
@@ -338,6 +431,33 @@ async def campaign(seed, cycles):
                     assert len(broker.mutations()) == before and broker.maximum == 1, broker.mutations()
                     events.append({"fault":"unusable-frame-flood","recovery_s":round(time.monotonic()-start,3),
                                    "replayed":0})
+                    # The link dies silently (no FIN/RST, no data, no PINGRESP) and the printer then
+                    # stays unreachable: what the live P1S did on 2026-11-02. Telemetry must go
+                    # not-live, writes are refused, the dead socket is released rather than left
+                    # open, the MCP stays healthy, and the session returns by itself afterwards.
+                    before, connections = len(broker.mutations()), broker.connections
+                    broker.reports = False
+                    start = time.monotonic()
+                    broker.blackhole()
+                    broker.mode = "refuse"
+                    await asyncio.sleep(1.5)
+                    state = await call("get_print_progress")
+                    assert state.get("error") == "telemetry_not_live", state
+                    await refuses_writes()
+                    await health_until(lambda h: "cannot" in str(h.get("reason")),
+                                       "dead link never abandoned", timeout=15)
+                    await released_dead_socket()
+                    assert (await watchdog_probe(url, "fixture"))["live"] is False
+                    broker.blackholed.clear()
+                    broker.mode = "normal"
+                    broker.reports = True
+                    await until_live()
+                    await asyncio.sleep(.2)
+                    assert broker.connections > connections, "session never came back"
+                    assert len(broker.mutations()) == before and broker.maximum == 1, broker.mutations()
+                    assert broker.sample_held() <= 1, broker.held_max
+                    events.append({"fault":"silent-link-loss-then-unreachable",
+                                   "recovery_s":round(time.monotonic()-start,3),"replayed":0})
                     # A dead HTTP process must not leave the existing client holding an
                     # invalid server session ID. Keep this exact ClientSession open.
                     before = len(broker.mutations())
@@ -448,7 +568,8 @@ async def campaign(seed, cycles):
             proc.wait(timeout=14)
             assert proc.returncode in (0,143,-15), proc.returncode
             return {"seed":seed,"cycles":cycles,"events":events,"max_mqtt_clients":broker.maximum,
-                    "mqtt_connections":broker.connections,"simulated_printer_commands":len(broker.mutations()),
+                    "mqtt_connections":broker.connections,"max_held_mqtt_sockets":broker.held_max,
+                    "connection_attempts":broker.attempts,"simulated_printer_commands":len(broker.mutations()),
                     "ftps_downloads":ftps.downloads, "camera_captures":camera.captures,
                     "transport":"MCP HTTP + TLS MQTT/FTPS/camera", "passed":True}
         except BaseException:

@@ -22,6 +22,12 @@ Replay a failure:
 
 ## What the gate observes
 
+* The printer is off when the server starts (TCP reset at connect). Status must
+  name the cause, writes are refused, reconnects back off (bounded attempts), and
+  the external watchdog probe still reports a healthy MCP: an offline printer is
+  not a reason to restart the service.
+* The printer rejects the LAN access code (CONNACK 5). Status must say
+  "Not authorized" rather than a generic "connecting", and writes are refused.
 * A real TCP reset during the job-start FTPS handshake must not stop MQTT state
   updates or force a replacement MQTT connection.
 * Stale, malformed, starting and disconnected telemetry must be visibly rejected
@@ -30,6 +36,13 @@ Replay a failure:
   synthetic TLS MQTT peer. Connection drops, silence, malformed frames and job
   transitions cannot create an extra MQTT owner or replay a write. The peer counts
   received mutation packets, not mock method calls.
+* The link dies silently (no FIN/RST, no data, no PINGRESP) and new connections
+  are then refused, as when the P1S dropped off Wi-Fi on 2026-11-02. Telemetry
+  must go not-live, writes are refused, the dead socket is released, the MCP
+  stays healthy and the session returns by itself when the printer does.
+* Client-side MQTT sockets are counted from `/proc/net/tcp` in the namespace at
+  every accepted connection and after every fault. More than one ESTABLISHED or
+  CLOSE_WAIT socket fails the run; CLOSE_WAIT is the 2026-11-01 leak.
 * Socket backpressure followed by disconnect produces an explicit unknown
   delivery result and no command replay. Killing the MCP process and starting
   its replacement must leave the same HTTP client usable.
@@ -49,7 +62,10 @@ printer implements wire protocols, not Python method mocks. These checks prove
 software behavior against that peer; physical extrusion remains a live check.
 
 All child tests use bubblewrap with a **private network namespace**, read-only
-host filesystem, private `/tmp` and temporary HOME. An unprivileged user namespace
+host filesystem, private `/tmp` and temporary HOME. The invoking user's real home
+directory is replaced by an empty tmpfs (only the checkout and the interpreter are
+bound back read-only), and `evidence/` is hidden, so the real Bambu Studio access
+code, `printer.env` and private transcripts are not readable by test code. An unprivileged user namespace
 permits binding the printer's FTPS port 990 inside that private network only.
 Only the fixture's loopback peer is reachable. Synthetic credentials enter through
 the normal Bambu Studio configuration reader. No real printer credential is passed
