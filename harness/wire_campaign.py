@@ -7,6 +7,7 @@ Seeds are recorded and replayable. No production credentials or printer address.
 import asyncio
 import base64
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -72,6 +73,9 @@ class Broker:
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(tmp/"cert.pem", tmp/"key.pem")
+        # No TLS 1.3 session tickets: bpm ends an FTPS upload with a bare TCP shutdown, and a
+        # ticket the server is still writing then resets the data channel before it is read.
+        self.ctx.num_tickets = 0
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 8883))
         self.port = self.listener.getsockname()[1]
@@ -88,6 +92,10 @@ class Broker:
         # normal | refuse (TCP reset at accept: printer off or unreachable) |
         # unauthorized (CONNACK 5: wrong LAN access code)
         self.mode = "normal"
+        # What this simulated printer is: its serial (model prefix 01P = P1S) names the MQTT topic,
+        # and its status reports carry the installed nozzle as a P1S does (None: not reported).
+        self.serial = "01P00TESTONLY"
+        self.nozzle = "0.4"
         self.attempts = 0
         self.refusals = 0
         # Peers whose link went dead: never read from or written to again, no PINGRESP.
@@ -116,7 +124,9 @@ class Broker:
                     "nozzle_temper": 240., "bed_temper": 75., "mc_percent": 3 if self.running else 0,
                     "gcode_file": "Metadata/plate_1.gcode", "subtask_name": "fixture-job",
                     "task_id": "77" if self.running else "0", "layer_num": 2, "total_layer_num": 115}}
-        topic = b"device/01P00TESTONLY/report"
+            if self.nozzle is not None:
+                data["print"]["nozzle_diameter"] = self.nozzle
+        topic = f"device/{self.serial}/report".encode()
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send(peer, packet(0x30, len(topic).to_bytes(2, "big")+topic+body))
 
@@ -251,13 +261,19 @@ async def campaign(seed, cycles):
         ftps = FTPSPeer(broker.ctx)
         camera = CameraPeer(broker.ctx)
         studio = tmp / "BambuStudio.conf"
-        studio.write_text(json.dumps({"user_access_code":{"01P00TESTONLY":"TESTONLY"}}))
+        # A P1S (01P) and an A1 (039) on the same synthetic access code; the A1 is used once.
+        studio.write_text(json.dumps({"user_access_code":{"01P00TESTONLY":"TESTONLY", "03900TESTONLY":"TESTONLY"}}))
         port = 25099  # private network namespace; production's registered port range
         env = os.environ.copy()
         env.update(HOME=str(tmp/"home"), BAMBU_MCP_PORT=str(port), BAMBU_MCP_DISABLE_REST="1",
                    BAMBU_MCP_ALLOW_CLIENT_CONFIG_WRITE="0", BAMBU_STUDIO_CONFIG=str(studio),
                    BAMBU_PRINTER_NAME="fixture", BAMBU_PRINTER_SERIAL="01P00TESTONLY",
-                   BAMBU_PRINTER_HOST="127.0.0.1", BAMBU_MCP_FTPS_TIMEOUT="2")
+                   BAMBU_PRINTER_HOST="127.0.0.1", BAMBU_MCP_FTPS_TIMEOUT="2",
+                   # The server runs this fixed process as its preparer, as it runs the real
+                   # Soyrack preflight in production; see fixture_preparer.py for what it is not.
+                   BAMBU_PREFLIGHT_COMMAND_JSON=json.dumps([sys.executable, str(ROOT/"harness/fixture_preparer.py")]),
+                   BAMBU_PREFLIGHT_TIMEOUT_S="3")
+        store = tmp/"home"/".bambu-mcp"/"preflight"
         Path(env["HOME"]).mkdir()
         log = (tmp/"server.log").open("w+")
         proc = subprocess.Popen([sys.executable, str(ROOT/"harness/fixture_server.py")],
@@ -498,12 +514,17 @@ async def campaign(seed, cycles):
                     assert "user_permission" in str(denied), denied
                     wrong_holder = await call("load_filament", unit_id=0, slot_id=255, user_permission=True)
                     assert "dual-nozzle" in str(wrong_holder), wrong_holder
-                    for filename, plate in [("broken.gcode.3mf",1),("fixture-job.gcode.3mf",2)]:
+                    downloads = len(ftps.downloads)
+                    # A valid sliced job already on the card (the file this campaign used to print)
+                    # is not admitted, so it is refused before any FTPS read or MQTT command.
+                    for filename, plate in [("broken.gcode.3mf",1),("fixture-job.gcode.3mf",2),
+                                            ("fixture-job.gcode.3mf",1)]:
                         refused = await call("print_file", file_path=filename, plate_num=plate,
                                              use_ams=False, user_permission=True)
-                        assert "error" in refused, refused
+                        assert refused.get("error") == "print_not_admitted", refused
                     assert len(broker.mutations()) == before, broker.mutations()[before:]
-                    events.append({"contract":"permission, invalid holder and invalid plate refuse before sending", "sent":0})
+                    assert len(ftps.downloads) == downloads, ftps.downloads[downloads:]
+                    events.append({"contract":"permission, invalid holder and unadmitted SD files refuse before sending", "sent":0})
                     loaded = await call("load_filament", unit_id=0, slot_id=254, user_permission=True)
                     assert "Load filament command sent" in str(loaded), loaded
                     commands = broker.mutations()[before:]
@@ -513,17 +534,282 @@ async def campaign(seed, cycles):
                         "ams_change_filament",254,254,0), load
                     events.append({"contract":"external holder loads without AMS", "sent":1})
                     await until_live()
+                    # ── Print admission. Only the server's own preparer run can admit a job; the
+                    # peer counts STOR transfers and received MQTT packets, not method calls.
+                    async def prepare(part):
+                        return payload(await asyncio.wait_for(
+                            c.call_tool("prepare_print_job", {"part": part}), 15))
+                    async def upload(local, remote):
+                        return await call("upload_file", local_path=str(local), remote_path=remote,
+                                          user_permission=True)
+                    async def start(remote, **args):
+                        return await call("print_file", file_path=remote, use_ams=False,
+                                          user_permission=True, **args)
+                    def runs():
+                        return sorted(p.name for p in store.iterdir() if p.is_dir()) if store.is_dir() else []
+                    async def replace_server(old, server_env):
+                        old.kill(); old.wait(timeout=5)
+                        for _ in range(100):
+                            if not broker.peers:
+                                break
+                            await asyncio.sleep(.02)
+                        assert not broker.peers, "dead server still owns MQTT socket"
+                        new = subprocess.Popen([sys.executable, str(ROOT/"harness/fixture_server.py")],
+                                               env=server_env, cwd=ROOT, stdout=log, stderr=log)
+                        for _ in range(100):
+                            assert new.poll() is None, "replacement fixture died"
+                            try:
+                                probe = socket.create_connection(("127.0.0.1", port), .1)
+                                probe.close(); break
+                            except OSError:
+                                await asyncio.sleep(.1)
+                        await until_live()
+                        assert broker.maximum == 1, broker.maximum
+                        return new
+                    # A connected printer reports on its own; the many write calls below must not land in
+                    # the stale window between this fixture's on-request reports.
+                    reporting = asyncio.Event()
+                    async def keep_reporting():
+                        while not reporting.is_set():
+                            broker.broadcast()
+                            await asyncio.sleep(.3)
+                    reporter = asyncio.create_task(keep_reporting())
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    seen = runs()
+                    for bad in ("../rim", "-rf", "Drive Tray", "x"*65, ""):
+                        refused = await prepare(bad)
+                        assert refused.get("error") == "invalid_part", (bad, refused)
+                    assert runs() == seen, "an invalid part name reached the preparer"
+                    # Outcomes a preparer can produce that must not admit anything. A passing-looking
+                    # report never stands in for a successful run, and the job left behind stays
+                    # unprintable.
+                    for part, code in {"fail_exit":"preflight_failed", "hang":"preflight_timeout",
+                                       "no_report":"preflight_rejected", "forged_hash":"preflight_rejected",
+                                       "geometry_fail":"preflight_rejected", "problems":"preflight_rejected",
+                                       "old_schema":"preflight_rejected", "running":"preflight_rejected",
+                                       "extra_part":"preflight_rejected", "symlink_job":"preflight_rejected",
+                                       "no_target":"preflight_rejected", "target_x1c":"preflight_rejected",
+                                       "job_target_mismatch":"preflight_rejected"}.items():
+                        refused = await prepare(part)
+                        assert refused.get("error") == code and "receipt_id" not in refused, (part, refused)
+                        left = [p for p in store.glob(f"*/{part}/{part}.gcode.3mf")]
+                        assert left, (part, "fixture wrote no job")
+                        refused = await upload(left[-1], f"/{part}.gcode.3mf")
+                        assert refused.get("error") == "job_not_prepared", (part, refused)
+                    assert "rim at z 12 mm" in json.dumps((await prepare("problems")).get("report")), "problems not reported"
+                    events.append({"contract":"failed, hung, forged, incomplete, untargeted, unqualified and "
+                                   "target-contradicting preparer runs admit nothing", "preparer_outcomes":13, "sent":0})
+                    # A caller's own PASS report and job, and an exact copy of a prepared job, are not
+                    # receipts. A job edited after preparation is refused at upload.
+                    from printer_peers import project_archive
+                    forged = tmp/"forged"/"rim_ok"
+                    forged.mkdir(parents=True)
+                    (forged/"rim_ok.gcode.3mf").write_bytes(project_archive(marker="rim_ok"))
+                    digest = hashlib.sha256((forged/"rim_ok.gcode.3mf").read_bytes()).hexdigest()
+                    (forged.parent/"preflight.json").write_text(json.dumps({
+                        "schema_version":2, "geometry_policy_version":1, "pass":True, "state":"complete",
+                        "parts":{"rim_ok":{"problems":[], "geometry":{"pass":True}, "job":digest}}}))
+                    prep = await prepare("rim_ok")
+                    assert prep.get("success") and prep["plates"] == [1], prep
+                    assert prep["target"] == {"printer_model":"Bambu Lab P1S", "nozzle_diameter":["0.4"],
+                                              "plate_type":"Textured PEI Plate", "bed_type":"textured_plate"}, prep
+                    job = Path(prep["job_path"]).read_bytes()
+                    assert hashlib.sha256(job).hexdigest() == prep["sha256"], prep
+                    (tmp/"copy.gcode.3mf").write_bytes(job)
+                    for local in (forged/"rim_ok.gcode.3mf", tmp/"copy.gcode.3mf"):
+                        refused = await upload(local, "/forged.gcode.3mf")
+                        assert refused.get("error") == "job_not_prepared", refused
+                    edited = await prepare("rim_ok")
+                    Path(edited["job_path"]).write_bytes(job + b"\0")
+                    refused = await upload(edited["job_path"], "/edited.gcode.3mf")
+                    assert refused.get("error") == "job_modified", refused
+                    refused = await upload(prep["job_path"], "/admitted.bin")
+                    assert refused.get("error") == "remote_not_project", refused
+                    assert len(ftps.stores) == stores, ftps.stores[stores:]
+                    # A non-job file still transfers, but cannot be renamed into a printable job, and a
+                    # download cannot write into the prepared-job store.
+                    (tmp/"notes.txt").write_text("diagnostics")
+                    sent = await upload(tmp/"notes.txt", "/notes.txt")
+                    assert sent.get("success") and "admission" not in sent and ftps.stores[-1] == "notes.txt", sent
+                    renames = sum(1 for verb, _ in ftps.commands if verb == "RNFR")
+                    refused = await call("rename_sdcard_file", src_path="/notes.txt",
+                                         dest_path="/notes.gcode.3mf", user_permission=True)
+                    assert refused.get("error") == "rename_creates_job", refused
+                    assert sum(1 for verb, _ in ftps.commands if verb == "RNFR") == renames
+                    refused = await call("download_file", remote_path="/notes.txt",
+                                         local_path=str(Path(prep["job_path"])), user_permission=True)
+                    assert refused.get("error") == "local_path_reserved", refused
+                    assert Path(prep["job_path"]).read_bytes() == job
+                    events.append({"contract":"caller reports, copies, edited jobs and renamed files are not admitted",
+                                   "uploads":len(ftps.stores)-stores})
+                    # Raw tools cannot start a file, write the SD card or extrude: refused by the raw
+                    # allowlist, or on the MQTT publish path itself (send_gcode has no own check).
                     before = len(broker.mutations())
-                    printed = await call("print_file", file_path="fixture-job.gcode.3mf",
-                                         use_ams=False, user_permission=True)
-                    assert "error" not in printed, printed
+                    for raw in ({"print":{"command":"project_file", "url":"file:///sdcard/admitted.gcode.3mf",
+                                          "file":"/admitted.gcode.3mf", "param":"Metadata/plate_1.gcode",
+                                          "sequence_id":"0"}},
+                                {"print":{"command":"gcode_file", "param":"/admitted.gcode", "sequence_id":"0"}},
+                                {"print":{"command":"gcode_line", "param":"M23 /a.gcode\nM24\n", "sequence_id":"0"}},
+                                {"print":{"command":"pause", "sequence_id":"0"}, "pushing":{"command":"pushall"}},
+                                {"upgrade":{"command":"start", "url":"http://x/fw.bin", "sequence_id":"0"}}):
+                        refused = await call("send_mqtt_command", command_json=json.dumps(raw), user_permission=True)
+                        assert refused.get("error") == "raw_command_refused", (raw, refused)
+                    for gcode in ("M23 /admitted.gcode.3mf\nM24", "M32 /admitted.gcode.3mf", "G1 X10 E5",
+                                  "g1e5", "G28\nG1 X5 Y5 E0.4 F600", "M28 job.gcode", "M810 G1 E5", "T1"):
+                        refused = await call("send_gcode", gcode=gcode, user_permission=True)
+                        assert "publish_rejected" in str(refused) and "not allowed" in str(refused), (gcode, refused)
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    off = await call("send_gcode", gcode="M104 S0\nM140 S0 ; heaters off", user_permission=True)
+                    assert "G-code sent" in str(off), off
+                    paused = await call("send_mqtt_command", user_permission=True,
+                                        command_json=json.dumps({"print":{"command":"pause", "sequence_id":"0"}}))
+                    assert paused.get("success"), paused
+                    await asyncio.sleep(.1)
+                    commands = broker.mutations()[before:]
+                    assert [m["print"]["command"] for m in commands] == ["gcode_line", "pause"], commands
+                    events.append({"contract":"raw MQTT and G-code cannot start, write SD or extrude; maintenance still sent",
+                                   "refused":13, "sent":2})
+                    # The admitted path: plate and options are checked before the admission is used, the
+                    # card is re-read before the start, and exactly one bound start reaches the wire.
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    up = await upload(prep["job_path"], "admitted.gcode.3mf")
+                    assert up.get("admission", {}).get("sha256") == prep["sha256"] and up["remote_path"] == "/admitted.gcode.3mf", up
+                    assert ftps.files["admitted.gcode.3mf"] == job and ftps.stores[stores:] == ["admitted.gcode.3mf"]
+                    for wrong, code in (({"plate_num":2}, "plate_not_admitted"), ({"bed_type":"lava_plate"}, "invalid_bed_type"),
+                                        ({"bed_type":"cool_plate"}, "bed_type_mismatch")):
+                        refused = await start("/admitted.gcode.3mf", **wrong)
+                        assert refused.get("error") == code, (wrong, refused)
+                    # The printer must match the prepared target as it reports itself now: a 0.6 mm nozzle
+                    # is refused, and a 0.4 report from before a reconnect does not count for the new link.
+                    async def nozzle_reported(value):
+                        await health_until(lambda h: h.get("reported_nozzle_diameter") == value,
+                                           f"nozzle {value!r} never reported", timeout=5)
+                    broker.nozzle = "0.6"
+                    await nozzle_reported("0.6")
+                    refused = await start("/admitted.gcode.3mf")
+                    assert refused.get("error") == "nozzle_mismatch", refused
+                    # Numeric parsing alone is insufficient: NaN compares unequal to no diameter,
+                    # so a naïve absolute-difference guard can accidentally authorize a start.
+                    for invalid in ("NaN", "Infinity", "0"):
+                        broker.nozzle = invalid
+                        await nozzle_reported(invalid)
+                        refused = await start("/admitted.gcode.3mf")
+                        assert refused.get("error") == "nozzle_unknown", (invalid, refused)
+                    broker.nozzle = None
+                    broker.drop()
+                    await until_live()
+                    await nozzle_reported(None)
+                    refused = await start("/admitted.gcode.3mf")
+                    assert refused.get("error") == "nozzle_unknown", refused
+                    broker.nozzle = "0.4"
+                    await nozzle_reported("0.4")
+                    ftps.files["admitted.gcode.3mf"] = job[:-1] + bytes([job[-1] ^ 1])  # replaced on the card
+                    refused = await start("/admitted.gcode.3mf")
+                    assert refused.get("error") == "remote_file_mismatch", refused
+                    ftps.files["admitted.gcode.3mf"] = job
+                    refused = await start("/admitted.gcode.3mf")
+                    assert refused.get("error") == "print_not_admitted", refused
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    await upload(prep["job_path"], "/admitted.gcode.3mf")
+                    downloads = len(ftps.downloads)
+                    printed = await start("/admitted.gcode.3mf")
+                    assert "error" not in printed and printed["admission"]["consumed"] is True, printed
+                    assert "admitted.gcode.3mf" in ftps.downloads[downloads:], "card not re-read before the start"
                     await asyncio.sleep(.1)
                     commands = broker.mutations()[before:]
                     assert len(commands) == 1, commands
                     command = commands[0]["print"]
-                    assert command["command"] == "project_file" and command["use_ams"] is False, command
-                    assert command["ams_mapping"] == [-1], command
-                    events.append({"contract":"external spool print reaches the wire once", "sent":1})
+                    assert (command["command"], command["file"], command["url"], command["param"]) == (
+                        "project_file", "/admitted.gcode.3mf", "file:///sdcard/admitted.gcode.3mf",
+                        "Metadata/plate_1.gcode"), command
+                    assert command["use_ams"] is False and command["ams_mapping"] == [-1], command
+                    assert command["bed_type"] == "textured_plate", command  # bed_type auto -> the prepared plate
+                    assert command["md5"] == hashlib.md5(job).hexdigest().upper(), command
+                    again = await start("/admitted.gcode.3mf")
+                    assert again.get("error") == "print_not_admitted", again
+                    assert len(broker.mutations()) == before + 1, broker.mutations()[before:]
+                    events.append({"contract":"prepared job: wrong plate, bed type, nozzle, unreported nozzle and "
+                                   "remote tamper refused; verified start names the prepared plate and MD5, "
+                                   "reaches the wire once; repeat refused", "sent":1})
+                    # Upload, rename and delete drop the admissions they could invalidate, first. The card
+                    # is case-insensitive, so a rename onto another spelling of the path counts.
+                    before = len(broker.mutations())
+                    for remote, change in (("/rename-me.gcode.3mf", ("rename_sdcard_file",
+                                            {"src_path":"/rename-me.gcode.3mf", "dest_path":"/renamed.gcode.3mf"})),
+                                           ("/target.gcode.3mf", ("rename_sdcard_file",
+                                            {"src_path":"/broken.gcode.3mf", "dest_path":"/TARGET.gcode.3mf"})),
+                                           ("/delete-me.gcode.3mf", ("delete_file", {"remote_path":"/delete-me.gcode.3mf"}))):
+                        assert (await upload(prep["job_path"], remote)).get("admission"), remote
+                        done = await call(change[0], user_permission=True, **change[1])
+                        assert done.get("success"), (change, done)
+                        for path in {remote, change[1].get("dest_path", remote)}:
+                            refused = await start(path)
+                            assert refused.get("error") == "print_not_admitted", (change, path, refused)
+                    assert (await upload(prep["job_path"], "/vanish.gcode.3mf")).get("admission")
+                    del ftps.files["vanish.gcode.3mf"]  # removed from the card by another client
+                    refused = await start("/vanish.gcode.3mf")
+                    assert refused.get("error") == "remote_file_missing", refused
+                    refused = await start("/vanish.gcode.3mf")
+                    assert refused.get("error") == "print_not_admitted", refused
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"rename, overwrite-by-rename, delete and external removal revoke "
+                                   "admission", "sent":0})
+                    # Unknown delivery of an admitted start: the MQTT socket is full, so the start cannot be
+                    # written within the publish bound. The admission is already consumed; the outcome is
+                    # unknown, nothing is retried, and calling print_file again is refused.
+                    assert (await upload(prep["job_path"], "/uncertain.gcode.3mf")).get("admission")
+                    before = len(broker.mutations())
+                    broker.block_reads = True  # the reporter keeps telemetry live meanwhile
+                    filler = await call("send_gcode", gcode=";HARNESS-ONLY-"+"x"*(8*1024*1024), user_permission=True)
+                    assert "publish_unconfirmed" in str(filler), str(filler)[:500]
+                    uncertain = await start("/uncertain.gcode.3mf")
+                    assert (uncertain.get("error"), uncertain.get("sent"), uncertain.get("retried")) == (
+                        "publish_unconfirmed", "unknown", False), uncertain
+                    assert uncertain["tool_result"].get("admission") == "consumed", uncertain
+                    broker.drop()
+                    broker.block_reads = False
+                    await until_live()
+                    await asyncio.sleep(.3)
+                    again = await start("/uncertain.gcode.3mf")
+                    assert again.get("error") == "print_not_admitted", again
+                    assert len(broker.mutations()) == before, "an unconfirmed start was replayed"
+                    events.append({"contract":"unknown start delivery consumes admission; never replayed", "replayed":0})
+                    # Admission lives in server memory: a restarted server admits nothing it did not prepare
+                    # itself. The replacement serves an A1 (serial 039...): a P1S job prepared and uploaded
+                    # there is refused as the wrong model before any card read or command.
+                    assert (await upload(prep["job_path"], "/restart.gcode.3mf")).get("admission")
+                    before, downloads = len(broker.mutations()), len(ftps.downloads)
+                    broker.serial = "03900TESTONLY"
+                    proc = await replace_server(proc, {**env, "BAMBU_PRINTER_SERIAL":"03900TESTONLY"})
+                    refused = await start("/restart.gcode.3mf")
+                    assert refused.get("error") == "print_not_admitted", refused
+                    refused = await upload(prep["job_path"], "/restart.gcode.3mf")
+                    assert refused.get("error") == "job_not_prepared", refused
+                    other = await prepare("rim_ok")
+                    assert other.get("success"), other
+                    assert (await upload(other["job_path"], "/other-model.gcode.3mf")).get("admission")
+                    refused = await start("/other-model.gcode.3mf")
+                    assert refused.get("error") == "printer_model_mismatch" and "A1" in refused["detail"], refused
+                    assert "other-model.gcode.3mf" not in ftps.downloads[downloads:], ftps.downloads[downloads:]
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"restart drops every admission; a P1S job on an A1 is refused", "sent":0})
+                    # A replacement with an untrusted preparer (world-writable directory) refuses without
+                    # running it.
+                    untrusted = tmp/"world-writable"
+                    untrusted.mkdir()
+                    os.chmod(untrusted, 0o777)
+                    (untrusted/"prep.py").write_text(f"open({str(tmp/'ran')!r}, 'w').close()\n")
+                    broker.serial = "01P00TESTONLY"
+                    proc = await replace_server(proc, {**env, "BAMBU_PREFLIGHT_COMMAND_JSON":
+                                                       json.dumps([sys.executable, str(untrusted/"prep.py")])})
+                    refused = await prepare("rim_ok")
+                    assert refused.get("error") == "preflight_command_untrusted", refused
+                    assert not (tmp/"ran").exists(), "untrusted preparer was run"
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    proc = await replace_server(proc, env)
+                    events.append({"contract":"untrusted preparer refused without running it", "sent":0})
+                    reporting.set()
+                    await reporter
                     broker.running = True
                     broker.broadcast()
                     for _ in range(20):

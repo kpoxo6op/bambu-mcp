@@ -1029,24 +1029,30 @@ error on the next push_status.
 
 ### POST /api/print_3mf
 
-⚠️ Start printing a .3mf file from SD card. ?filename=&platenum=&plate=AUTO|COOL_PLATE|ENG_PLATE|HOT_PLATE|TEXTURED_PLATE&use_ams=true|false&ams_mapping=&bl=true|false&flow=true|false&tl=true|false
+⚠️ Start an admitted job from SD card. ?filename=&platenum=&plate=AUTO|COOL_PLATE|ENG_PLATE|HOT_PLATE|TEXTURED_PLATE&use_ams=true|false&ams_mapping=&bl=true|false&flow=true|false&tl=true|false
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
 ⛔ BLOCKED during active prints (gcode_state RUNNING or PREPARE) — returns 409.
-Returns 400 when bpm refuses the plate, for example use_ams=false on a dual-nozzle plate
-that carries no extruder map.
+Runs the MCP print_file admission: ``filename`` must be a remote path that the MCP
+``upload_file`` tool bound to a job prepared by ``prepare_print_job`` in this server's
+lifetime; the file is downloaded and must still match it, and the printer must be the
+job's target (model, nozzle, plate; ``plate`` AUTO names the prepared plate). Admission
+refusals (not admitted, another plate, file changed or missing, wrong printer model or
+nozzle) return 403 before any command is sent; other refusals (invalid parameters,
+unmatched filament, unreadable metadata, FTPS failure) 400; 502 when the start's
+delivery failed.
 
 **Request body** (`application/x-www-form-urlencoded` or `application/json`)
 
 - `printer` (string, required, example `H2D`): Printer name. Omit to use the default printer. Required. Use GET /api/default_printer to resolve the current default.
-- `filename` (string, example `/_jobs/myprint.gcode.3mf`): Full SD card path to the .3mf file (e.g. /_jobs/myprint.gcode.3mf).
 - `platenum` (integer, example `1`): Plate number within the .3mf project (1-based).
+- `filename` (string, example `/_jobs/myprint.gcode.3mf`): Full SD card path to the .3mf file (e.g. /_jobs/myprint.gcode.3mf).
 - `plate` (one of `"auto"`, `"cool_plate"`, `"eng_plate"`, `"hot_plate"`, `"textured_plate"`, example `TEXTURED_PLATE`): Build plate surface type.
 - `use_ams` (boolean, required, example `true`): Print from the AMS. With no ams_mapping the mapping is resolved from the loaded spools by type and colour; the request is refused (400) when a filament has no loaded match. With use_ams=false the plate's own extruder assignment picks the external holder, and a dual-nozzle plate with no extruder map is refused (400).
 - `ams_mapping` (string, required, example ``): JSON array indexed by 1-based filament id, each an absolute tray id (4-slot AMS ams_id\*4+slot, AMS HT 128+slot, -1 unused), e.g. [1,-1,128]. Omit to resolve from the loaded spools — the project file carries no usable mapping.
+- `tl` (boolean, required, example `false`): Record a timelapse of the print.
 - `bl` (boolean, required, example `true`): Run bed leveling before printing.
 - `flow` (boolean, required, example `false`): Run flow/extrusion calibration before printing.
-- `tl` (boolean, required, example `false`): Record a timelapse of the print.
 
 **Responses**
 
@@ -1093,6 +1099,9 @@ is a Tier 1 violation when a dedicated temperature route exists).
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
 ⛔ BLOCKED during active prints (gcode_state RUNNING or PREPARE) — returns 409.
+⛔ Maintenance G-code only (the MCP send_gcode allowlist, enforced on the MQTT publish
+path): extrusion, SD-card file commands, macros and unknown commands return 403 and
+nothing is sent. 503 when the write is refused for another reason (telemetry not live).
 
 **Request body** (`application/x-www-form-urlencoded` or `application/json`)
 
@@ -1116,9 +1125,10 @@ is a Tier 1 violation when a dedicated temperature route exists).
 ⚠️ Send a raw MQTT command JSON to the printer's request topic. ?command_json=&lt;json>
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
-⚠️ LAST-RESORT TOOL. Bypasses all safety checks. Incorrect commands can damage
-prints, trigger hardware faults, or put the printer into an unrecoverable state.
-command_json must be a valid JSON string matching the Bambu Lab MQTT command schema.
+⚠️ LAST-RESORT TOOL. Incorrect commands can damage prints or trigger hardware faults.
+command_json must be one allowlisted non-start command (the MCP send_mqtt_command
+allowlist); print starts, file references, G-code and unlisted commands return 403
+and nothing is sent.
 
 **Request body** (`application/x-www-form-urlencoded` or `application/json`)
 
@@ -1759,6 +1769,7 @@ SD card file listing, upload, download, delete, rename, and 3MF project metadata
 ⚠️ Delete a file or folder from SD card. ?file=&lt;path> (trailing / for folder)
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+A print admission for the file (or anything under the folder) is dropped first.
 
 **Parameters**
 
@@ -2108,6 +2119,8 @@ is a success.
 Rename or move an SD card file. ?src=&lt;path>&dest=&lt;path>
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+Print admissions for src and dest are dropped first. Renaming a non-printable name to a
+.3mf/.gcode name is refused with 403 (it would create an unprepared job).
 
 **Request body** (`application/x-www-form-urlencoded` or `application/json`)
 
@@ -2149,6 +2162,8 @@ Upload a file to the local uploads directory. POST multipart/form-data with fiel
 ⚠️ Upload a local file to the printer SD card. ?src=&lt;filename_in_uploads>&dest=&lt;remote_path>
 
 ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+Printable jobs (.3mf/.gcode on either side) are refused with 403: a file in the uploads
+directory is never a prepared job. Upload prepared jobs with the MCP upload_file tool.
 
 **Request body** (`application/x-www-form-urlencoded` or `application/json`)
 

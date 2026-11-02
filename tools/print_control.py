@@ -467,26 +467,33 @@ def send_gcode(
     user_permission: bool = False,
 ) -> str:
     """
-    Send one or more raw G-code commands to the printer.
+    Send one or more maintenance G-code commands to the printer.
 
-    WHEN to use: run a well-understood G-code command (homing, a manual move, heater off) that
-    no dedicated tool covers, while the printer is idle. For standard operations (pause, speed,
-    fan) prefer the dedicated tools instead.
+    WHEN to use: run a well-understood maintenance command (homing, a manual move, heater or
+    fan off, motors off) that no dedicated tool covers, while the printer is idle. For
+    standard operations (pause, speed, fan) prefer the dedicated tools instead.
 
-    WRITE GUARD: sends raw G-code that the printer applies immediately to the hardware,
-    bypassing all print-job safety checks. Incorrect commands can crash the toolhead, damage the
-    printer, or trigger a fault. With ``user_permission`` unset the tool changes nothing and
-    returns the refusal string naming that consequence. It is also blocked during active prints,
-    judged from live telemetry: RUNNING and PREPARE are blocked. The registered MCP tool
-    also refuses writes before a complete state report and while telemetry is stale, paused,
-    disconnected or incomplete.
-    Every other state, including PAUSE, is allowed through. When the block does not apply, the
-    G-code is sent as-is and could crash the toolhead into the print or trigger hardware faults.
+    WRITE GUARD: sends G-code that the printer applies immediately to the hardware. Incorrect
+    commands can crash the toolhead, damage the printer, or trigger a fault. With
+    ``user_permission`` unset the tool changes nothing and returns the refusal string naming
+    that consequence. It is also blocked during active prints, judged from live telemetry:
+    RUNNING and PREPARE are blocked. The registered MCP tool also refuses writes before a
+    complete state report and while telemetry is stale, paused, disconnected or incomplete.
+    Every other state, including PAUSE, is allowed through. When the block does not apply, an
+    allowed move is sent as-is and could crash the toolhead into the print.
 
-    Sibling disambiguation: ``send_gcode`` is the raw escape hatch. ``set_nozzle_temp``,
+    MAINTENANCE ALLOWLIST (enforced on the MQTT publish path for every caller): each line, after
+    comments, must be one of G0/G1 (X Y Z F only: no extrusion), G4, G28, G90, G91, M17, M18,
+    M84, M104, M109, M140, M190, M141, M191, M106, M107, M105, M114 or M400. Extrusion (an E
+    word on a move), SD-card file commands (M23/M24/M28/M29/M30/M32...), macros, tool changes
+    and any other command make the whole payload refused with nothing sent. Prints start only
+    through ``prepare_print_job`` -> ``upload_file`` -> ``print_file``; filament moves go through
+    ``load_filament`` / ``unload_filament``.
+
+    Sibling disambiguation: ``send_gcode`` is the maintenance escape hatch. ``set_nozzle_temp``,
     ``set_bed_temp``, ``set_fan_speed`` and ``pause_print`` are the dedicated tools for the
-    common cases; ``send_mqtt_command`` sends a raw MQTT JSON command instead of G-code and is not
-    subject to the active-print block.
+    common cases; ``send_mqtt_command`` sends one allowlisted non-start MQTT JSON command and
+    does not carry G-code.
 
     Args:
         name: Configured printer name (see ``get_configured_printers``).
@@ -505,8 +512,9 @@ def send_gcode(
         ``"Error: user_permission must be True to perform this action. <consequence>"``,
         ``"Error: Printer '<name>' not connected."``, the active-print block ``"Blocked: '<name>'
         is currently <RUNNING|PREPARE>. send_gcode is not safe while a print is active. Wait for
-        the print to finish, pause it first, or cancel it."``, or ``"Error sending G-code to
-        '<name>': <exception>"``.
+        the print to finish, pause it first, or cancel it."``, ``"Error (publish_rejected): No
+        command was sent and none will be sent later (<why the G-code is not allowed>)..."``,
+        or ``"Error sending G-code to '<name>': <exception>"``.
     """
     log.debug("send_gcode: called for name=%s gcode=%r user_permission=%s", name, gcode, user_permission)
     if not user_permission:

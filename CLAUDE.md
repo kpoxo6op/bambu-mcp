@@ -18,10 +18,11 @@
 
 ## Architecture
 
-- 104 MCP tools, 87 HTTP routes (2026-09-27 via `gen_docs.py`, after closing tool and route gaps; 2026-09-17: added `/api/set_bpm_verbose` — live per-session `BambuConfig.verbose` toggle, no restart), 1 system prompt (domain knowledge lives in node-kb-mcp `bambu-*` articles)
+- 106 MCP tools, 87 HTTP routes (2026-11-02 via `gen_docs.py`: added `prepare_print_job`; 2026-09-17: added `/api/set_bpm_verbose` — live per-session `BambuConfig.verbose` toggle, no restart), 1 system prompt (domain knowledge lives in node-kb-mcp `bambu-*` articles)
 - All printer ops route through BPM library via `session_manager.get_printer(name)`
 - BPM is considered stable — do not modify it to solve MCP-layer problems
 - No tool may open its own direct FTPS/MQTT/socket/HTTP connection (camera streaming excepted)
+- Prints start only through `print_admission.py`: `prepare_print_job` (operator-configured preparer, `BAMBU_PREFLIGHT_COMMAND_JSON`) → `upload_file` → `print_file`; the publish guard refuses any other start, SD-card or extruding G-code. See `docs/print-admission.md`; never add an override
 - REST API server, camera stream servers and their relay children draw ports from a shared `PortPool` (default 49152-49251)
 - Port discovery: `get_server_info()` MCP tool or `GET /api/server_info` — never hardcode ports
 - Camera subsystem: `camera/mse_relay.py` runs bambu-mse-stream (vendored at a pinned commit as `camera/mse_relay_server.py`) as one child per streaming printer; `camera/mjpeg_server.py` serves the HUD page and proxies the relay's fMP4. RTSPS (H2D/X1) + TCP-TLS (A1/P1) single-frame clients remain for snapshots with no stream running; anomaly detection

@@ -73,11 +73,12 @@ PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
 })
 
 # Non-read-only tools that send no printer write: local session/config management, SD reads,
-# and the version/pushall refresh requests (allowed while stale: they are how state recovers).
+# the local print preparer, and the version/pushall refresh requests (allowed while stale: they
+# are how state recovers).
 NON_PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
     "add_printer", "disconnect_printer", "download_file", "force_state_refresh", "pause_mqtt_session",
-    "remove_printer", "resume_mqtt_session", "set_user_pref", "start_printer", "start_stream",
-    "stop_stream", "trigger_printer_refresh", "truncate_log", "update_printer_credentials",
+    "prepare_print_job", "remove_printer", "resume_mqtt_session", "set_user_pref", "start_printer",
+    "start_stream", "stop_stream", "trigger_printer_refresh", "truncate_log", "update_printer_credentials",
 })
 
 # Read tools whose answer is the printer's current MQTT-reported state.

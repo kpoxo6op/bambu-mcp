@@ -15,21 +15,25 @@ Agent behavioral rules live in the forge `bambu-ecosystem.md` rule (auto-loaded 
 every consumer of this MCP regardless of working directory.
 
 ### Printer Write Protection — Absolute, No Exceptions, Never Bypassed
-NEVER send a write or destructive operation to a physical printer without the user typing
-explicit permission in plain text in the current conversation turn. Prohibited without it
-(not exhaustive): firmware (`upgrade.start` / any `upgrade.*`), MQTT publish to any
-`device/*/request` topic, raw GCode, configuration changes, any FTP/file upload to a printer.
-`--dry-run` is safe; anything that touches physical hardware is not. Applies in interactive,
-autopilot, background-agent, and scripted modes alike. Every hardware-modifying tool gates on
-`user_permission=True`; the active-print guard is a First-Law hard block that
-`user_permission=True` cannot override.
+NEVER send a write or destructive operation to a physical printer without the user's explicit
+authorization for that task. Authorization the user gave for a task stays valid for that task:
+do not ask for it again each turn or for each step. Prohibited without it (not exhaustive):
+firmware (`upgrade.start` / any `upgrade.*`), MQTT publish to any `device/*/request` topic, raw
+GCode, configuration changes, any FTP/file upload to a printer. `--dry-run` is safe; anything
+that touches physical hardware is not. Applies in interactive, autopilot, background-agent, and
+scripted modes alike. Every hardware-modifying tool gates on `user_permission=True`; the
+active-print guard is a First-Law hard block that `user_permission=True` cannot override, and
+every printer write is refused while telemetry is not live.
 
-### Pre-Print Confirmation Gate (Mandatory)
-Never call `print_file` without explicit user confirmation in the current turn. Gather
-`get_project_info` + `get_ams_units` + `get_spool_info` first, then present ONE complete
-summary — parts/filaments, `bed_type`, `ams_mapping`, `flow_calibration`, `timelapse`,
-`bed_leveling` — and wait for go-ahead AFTER the full summary. Confirming parameters across
-separate turns does NOT satisfy the gate.
+### Printing — admission is enforced by the server
+A print runs only as `prepare_print_job(part)` → `upload_file(job_path)` → `print_file(remote)`.
+The server refuses anything else before sending a command: other or edited files, a job for a
+different printer model, nozzle or plate, stale telemetry, and anything after a restart. The
+user's request to print is the authorization; no extra conversational gate is required. Software
+cannot sense the physical plate or loaded filament: say which plate the job was prepared for
+(`target.plate_type`), report `preview_ams_mapping` match labels, and use the camera to check the
+bed. Use stored preferences (`get_user_pref`) for bed_leveling / flow_calibration / timelapse
+unless the user asked otherwise.
 
 ### Credentials
 Never reference real printer names, IPs, serials, or access codes in code, docs, or responses
@@ -106,7 +110,9 @@ tangle, temperature malfunction, clog) are reported as HMS errors with severity 
 (spaghetti, nozzle clumping, air printing). Can pause the print automatically.
 
 **SD card** — print jobs (.3mf files) are stored on the printer's internal SD card.
-Upload a .3mf file first, then call print_file() to start printing.
+A print starts only from a job this server prepared: prepare_print_job(part), then
+upload_file() with the returned job_path, then print_file() on that remote path. Other
+.3mf/.gcode files cannot be uploaded as jobs or started (docs/print-admission.md).
 
 **3MF file** — the print job format from BambuStudio/OrcaSlicer. A ZIP archive containing
 G-code, thumbnails, filament mapping, and object metadata. Can have multiple plates.
@@ -164,7 +170,8 @@ Control the active print job. These tools interact directly with physical hardwa
 - skip_objects(name, object_ids) — skip print objects by ID (from get_project_info bbox_objects)
 - set_print_option(name, option, enabled) — toggle auto_recovery / filament_tangle_detect / sound_enable /
   auto_switch_filament / nozzle_blob_detect / air_print_detect
-- send_gcode(name, gcode) — send raw G-code; LAST RESORT — prefer dedicated tools; bypasses safety checks
+- send_gcode(name, gcode) — maintenance G-code only (homing, jog without E, heaters, fans, motors off);
+  LAST RESORT — prefer dedicated tools; extrusion, SD-card file commands and macros are refused
 - select_extrusion_calibration(name, tray_id, cali_idx=-1) — apply saved flow calibration profile
 
 Manage the heated components: nozzle (melts filament, ~200–300°C), bed (build surface, ~50–110°C), and chamber (enclosed heating on some models). Wrong temperatures cause print failures or hardware damage. All require user_permission=True.
@@ -220,9 +227,13 @@ Manage files on the printer's SD card and prepare print jobs. Upload .3mf files 
   quality: "preview" (~5 KB) / "standard" (~16 KB, default) / "full" (~71 KB)
 - get_plate_topview(name, file_path, plate_num, quality="standard") — top-down view image only
   Same quality tiers as get_plate_thumbnail.
-- upload_file / download_file / delete_file / create_folder — file operations
+- prepare_print_job(part) — run the server's configured preparer (render, slice, support check); the only
+  source of a printable job. Returns job_path; memory only, lost on restart
+- upload_file / download_file / delete_file / create_folder — file operations; a .3mf/.gcode upload must be a
+  prepared job_path and binds the remote path for ONE print_file; rename/delete/re-upload revoke it
 - rename_sdcard_file(name, src_path, dest_path) — FTPS rename/move file on SD card
-- print_file(name, file_path, plate_num, bed_type, use_ams, ams_mapping?, ...) — start print from SD card
+- print_file(name, file_path, plate_num, bed_type, use_ams, ams_mapping?, ...) — start an admitted upload; the card
+  is re-read and must match the prepared job; one start per upload, never retried
   ams_mapping: optional override, indexed by 1-based filament id. Omit it and print_file resolves the
   mapping from the spools the printer last reported (exact type, then closest colour — bambu-printer-app's
   scoring; a same-material wrong-colour spool IS accepted as "Type Match") and REFUSES if a filament has
@@ -303,10 +314,10 @@ Session-level operations: MQTT connection management, firmware version, telemetr
 - set_print_options(name, auto_recovery?, sound?) — REQUIRE user_permission=True
 - rename_printer(name, new_name) — change printer's firmware display name; REQUIRE user_permission=True
 
-Last-resort tool for sending raw MQTT JSON commands when no dedicated tool exists. Bypasses all safety guardrails. Requires user_permission=True AND strong justification. Do not use unless a specific dedicated tool does not exist.
+Last-resort tool for sending one allowlisted, non-start MQTT JSON command when no dedicated tool covers the parameters. It cannot start a print, name a file, send G-code or upgrade firmware. Requires user_permission=True AND strong justification.
 
 ### Raw Command (tools/commands.py) — LAST RESORT, REQUIRE user_permission=True
-- send_mqtt_command(name, command_json) — raw MQTT command; use only when no dedicated tool exists
+- send_mqtt_command(name, command_json) — allowlisted non-start MQTT command; use only when no dedicated tool fits
 
 Bambu domain knowledge (protocol, enums, BambuPrinter API, HTTP API, empirical/calibration) is canonical in node-kb-mcp as `bambu-*` articles — query it directly; there is no baked-in knowledge tool.
 
@@ -330,9 +341,8 @@ ANY operation that modifies printer state or sends commands to hardware REQUIRES
 explicit user_permission=True. If the parameter is False or omitted, the tool
 returns an error message without making any change.
 
-High-risk operations (firmware update, factory reset) have no dedicated tool —
-they can only be reached via send_mqtt_command, which itself requires user_permission=True
-AND is guarded by a double-confirmation check in the tool docstring.
+High-risk operations (firmware update, factory reset) have no dedicated tool and are
+not on send_mqtt_command's allowlist, so this server cannot send them.
 
 ## Session Start Protocol
 
