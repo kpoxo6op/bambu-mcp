@@ -38,6 +38,12 @@ Edit `~/.config/bambu-mcp/printer.env`: set the printer host and serial, and set
 file contains the credential-source path, not the access code. The launcher
 uses the current user's home directory; no `/home/boris` path is required.
 
+Printing needs the job preparer: set `BAMBU_PREFLIGHT_COMMAND_JSON` to the
+absolute command that renders, slices and checks a part (for the Soyrack guide,
+`/usr/bin/node` and its `preflight.mjs`). Without it the server starts, but
+`prepare_print_job` refuses and so does every print. See
+[print-admission.md](print-admission.md) for the rules and a check run.
+
 ## Start the shared service
 
 For the standard checkout location above:
@@ -55,7 +61,9 @@ systemd manager is running; GitHub Actions runs independently of this computer.
 
 Before sending a print, call `get_printer_connection_status`, `get_print_progress`
 and `get_camera_image`. Telemetry must be live and the physical bed must be ready.
-Software restoration does not itself start heating, loading or printing.
+Software restoration does not itself start heating, loading or printing. Jobs
+prepared before a restart are forgotten: run `prepare_print_job` and `upload_file`
+again.
 
 ## Keep the recoverable copy current
 

@@ -54,7 +54,7 @@ not assign a new license to upstream code that did not ship one.
 ## Tools
 
 <!-- gen_docs:tools:begin -->
-105 tools (52 read-only, 53 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
+106 tools (52 read-only, 54 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
 
 | Category | Tools |
 |---|---|
@@ -65,7 +65,7 @@ not assign a new license to upstream code that did not ship one.
 | [Nozzles](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/nozzle/) | `get_nozzle_info`, `refresh_nozzles`, `set_nozzle_config`, `swap_tool` |
 | [Detectors](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/detectors/) | `get_detector_settings`, `set_air_printing_detection`, `set_buildplate_marker_detection`, `set_first_layer_inspection`, `set_nozzle_clumping_detection`, `set_purge_chute_detection`, `set_spaghetti_detection` |
 | [Printer Management](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/management/) | `add_printer`, `disconnect_printer`, `get_configured_printers`, `get_printer_connection_status`, `remove_printer`, `start_printer`, `update_printer_credentials` |
-| [Files](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/files/) | `create_folder`, `delete_file`, `download_file`, `get_3mf_entry_by_id`, `get_3mf_entry_by_name`, `get_all_project_info`, `get_current_job_project_info`, `get_file_info`, `get_plate_thumbnail`, `get_plate_topview`, `get_project_info`, `list_sdcard_files`, `open_plate_layout`, `open_plate_viewer`, `preview_ams_mapping`, `print_file`, `refresh_sdcard`, `rename_sdcard_file`, `upload_file` |
+| [Files](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/files/) | `create_folder`, `delete_file`, `download_file`, `get_3mf_entry_by_id`, `get_3mf_entry_by_name`, `get_all_project_info`, `get_current_job_project_info`, `get_file_info`, `get_plate_thumbnail`, `get_plate_topview`, `get_project_info`, `list_sdcard_files`, `open_plate_layout`, `open_plate_viewer`, `prepare_print_job`, `preview_ams_mapping`, `print_file`, `refresh_sdcard`, `rename_sdcard_file`, `upload_file` |
 | [System](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/system/) | `dump_log`, `force_state_refresh`, `get_firmware_version`, `get_server_info`, `get_session_status`, `get_user_pref`, `pause_mqtt_session`, `rename_printer`, `resume_mqtt_session`, `set_print_options`, `set_user_pref`, `trigger_printer_refresh`, `truncate_log` |
 | [Discovery](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/discovery/) | `discover_printers` |
 | [Raw Commands](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/commands/) | `send_mqtt_command` |

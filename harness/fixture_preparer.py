@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Fixed preparer process for the E2E campaign: the server-configured peer at the process boundary.
+
+The server runs it as BAMBU_PREFLIGHT_COMMAND_JSON + [<out>, <part>], exactly as it runs the
+Soyrack preflight. It renders, slices and checks NOTHING: the part name selects an outcome a
+real preparer can produce (a pass, a failed process, a forged or incomplete report, a symlinked
+job, a hang), so the campaign proves which of them the server admits. Real CAD, slicer and
+support geometry are covered by the Soyrack repository's own preflight E2E.
+"""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from printer_peers import project_archive  # noqa: E402
+
+out, part = Path(sys.argv[1]), sys.argv[2]
+out.mkdir()  # a new run never reuses a directory; an existing one fails here
+(out / part).mkdir()
+job = out / part / f"{part}.gcode.3mf"
+# job_target_mismatch: the report names the P1S 0.4 target, but the job's G-code was sliced for 0.6.
+job.write_bytes(project_archive(marker=part, nozzle="0.6" if part == "job_target_mismatch" else "0.4"))
+entry = {"stl": "0" * 64, "triangles": 12, "problems": [],
+         "geometry": {"pass": True, "policy_version": 1, "policy": "fixture"},
+         "target": {"printer_model": "Bambu Lab P1S", "nozzle_diameter": ["0.4"], "plate_type": "Textured PEI Plate"},
+         "job": hashlib.sha256(job.read_bytes()).hexdigest(), "slicer": "fixture", "minutes": 1, "grams": 1,
+         "watch": []}
+report = {"schema_version": 2, "geometry_policy_version": 1, "pass": True, "state": "complete",
+          "commit": "fixture", "profiles": {}, "parts": {part: entry}}
+code = 0
+if part == "fail_exit":
+    code = 1                                  # passing report, failed process
+elif part == "no_report":
+    report = None
+elif part == "forged_hash":
+    entry["job"] = "f" * 64                   # report claims other bytes
+elif part == "geometry_fail":
+    entry["geometry"]["pass"] = False         # pass: true at the top, geometry failed
+elif part == "problems":
+    entry["problems"] = ["rim at z 12 mm crosses 9 mm of open air without support"]
+elif part == "old_schema":
+    report["schema_version"] = 1
+elif part == "running":
+    report["state"] = "running"
+elif part == "extra_part":
+    report["parts"]["other_part"] = dict(entry)
+elif part == "no_target":
+    del entry["target"]
+elif part == "target_x1c":
+    entry["target"]["printer_model"] = "Bambu Lab X1 Carbon"   # not qualified for policy 1
+elif part == "symlink_job":
+    elsewhere = out / "elsewhere.bin"
+    job.rename(elsewhere)
+    job.symlink_to(elsewhere)                 # same bytes and hash, reached through a symlink
+if report is not None:
+    (out / "preflight.json").write_text(json.dumps(report))
+if part == "hang":
+    time.sleep(60)                            # a passing report from a process that never finished
+sys.exit(code)

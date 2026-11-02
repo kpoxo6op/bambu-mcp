@@ -1476,12 +1476,18 @@ def _build_app():
 
     @app.route("/api/print_3mf", methods=["POST"])
     def print_3mf():
-        """⚠️ Start printing a .3mf file from SD card. ?filename=&platenum=&plate=AUTO|COOL_PLATE|ENG_PLATE|HOT_PLATE|TEXTURED_PLATE&use_ams=true|false&ams_mapping=&bl=true|false&flow=true|false&tl=true|false
+        """⚠️ Start an admitted job from SD card. ?filename=&platenum=&plate=AUTO|COOL_PLATE|ENG_PLATE|HOT_PLATE|TEXTURED_PLATE&use_ams=true|false&ams_mapping=&bl=true|false&flow=true|false&tl=true|false
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
         ⛔ BLOCKED during active prints (gcode_state RUNNING or PREPARE) — returns 409.
-        Returns 400 when bpm refuses the plate, for example use_ams=false on a dual-nozzle plate
-        that carries no extruder map.
+        Runs the MCP print_file admission: ``filename`` must be a remote path that the MCP
+        ``upload_file`` tool bound to a job prepared by ``prepare_print_job`` in this server's
+        lifetime; the file is downloaded and must still match it, and the printer must be the
+        job's target (model, nozzle, plate; ``plate`` AUTO names the prepared plate). Admission
+        refusals (not admitted, another plate, file changed or missing, wrong printer model or
+        nozzle) return 403 before any command is sent; other refusals (invalid parameters,
+        unmatched filament, unreadable metadata, FTPS failure) 400; 502 when the start's
+        delivery failed.
         """
         log.debug("print_3mf: called")
         p, pname = _get_printer(_rargs())
@@ -1492,35 +1498,39 @@ def _build_app():
         if blocked:
             return _err(blocked["error"], code=HTTPStatus.CONFLICT)
         try:
-            from bpm.bambutools import PlateType
-            filename = _rargs().get("filename", "")
-            platenum = int(_rargs().get("platenum", 0))
-            plate_str = _rargs().get("plate", "AUTO").upper()
-            platetype = PlateType[plate_str]
-            use_ams = _rargs().get("use_ams") == "true"
-            ams_mapping = _rargs().get("ams_mapping")
-            bl = _rargs().get("bl") == "true"
-            flow = _rargs().get("flow") == "true"
-            tl = _rargs().get("tl") == "true"
-            if use_ams and not ams_mapping:
-                # Same resolution as the print_file MCP tool: the 3mf carries no
-                # usable mapping, so build it from the loaded spools or refuse.
-                from tools.files import _resolve_print_mapping
-                res = _resolve_print_mapping(pname or "unknown", p, filename, platenum)
-                if "error" in res:
-                    log.warning("print_3mf: refused: %s", res["error"])
-                    return _err(res["error"], code=HTTPStatus.BAD_REQUEST)
-                ams_mapping = res["ams_mapping_json"]
-            log.debug("print_3mf: filename=%s platenum=%s plate=%s use_ams=%s ams_mapping=%s", filename, platenum, platetype, use_ams, ams_mapping)
-            p.print_3mf_file(filename, platenum, platetype, use_ams, ams_mapping=ams_mapping, bedlevel=bl, flow=flow, timelapse=tl)
-            log.debug("print_3mf: → ok")
-            return _ok()
+            from tools.files import print_file
+            platenum = int(_rargs().get("platenum", 1) or 1)
+            result = print_file(
+                pname, _rargs().get("filename", ""), plate_num=platenum,
+                bed_type=_rargs().get("plate", "AUTO").lower(),
+                use_ams=_rargs().get("use_ams") == "true",
+                ams_mapping=_rargs().get("ams_mapping") or None,
+                timelapse=_rargs().get("tl") == "true",
+                bed_leveling=_rargs().get("bl") == "true",
+                flow_calibration=_rargs().get("flow") == "true",
+                user_permission=True,
+            )
         except ValueError as e:
-            log.warning("print_3mf: refused: %s", e)
             return _err(str(e), code=HTTPStatus.BAD_REQUEST)
         except Exception as e:
             log.error("print_3mf: error: %s", e, exc_info=True)
             return _err(str(e))
+        if "error" not in result:
+            log.debug("print_3mf: → ok")
+            return _ok(admission=result.get("admission"))
+        error = str(result["error"])
+        log.warning("print_3mf: refused: %s %s", error, result.get("detail", ""))
+        if error.startswith("Blocked"):
+            code = HTTPStatus.CONFLICT
+        elif error in ("print_not_admitted", "plate_not_admitted", "remote_file_missing", "remote_file_mismatch",
+                       "bed_type_mismatch", "printer_model_unknown", "printer_model_mismatch",
+                       "printer_not_qualified", "nozzle_unknown", "nozzle_mismatch"):
+            code = HTTPStatus.FORBIDDEN
+        elif result.get("admission") == "consumed":
+            code = HTTPStatus.BAD_GATEWAY
+        else:
+            code = HTTPStatus.BAD_REQUEST
+        return jsonify({"status": "error", "reason": error, **{k: v for k, v in result.items() if k != "error"}}), code
 
     @app.route("/api/skip_objects", methods=["POST"])
     def skip_objects():
@@ -1711,20 +1721,22 @@ def _build_app():
         """⚠️ Delete a file or folder from SD card. ?file=<path> (trailing / for folder)
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+        A print admission for the file (or anything under the folder) is dropped first.
         """
         log.debug("delete_sdcard_file: called")
-        p, _ = _get_printer(_rargs())
+        p, pname = _get_printer(_rargs())
         if p is None:
             return _err("no printer")
+        import print_admission
+        from tools.files import _guarded_delete
         try:
             path = _rargs().get("file", "")
             log.debug("delete_sdcard_file: path=%s", path)
-            if path.endswith("/"):
-                result = p.delete_sdcard_folder(path)
-            else:
-                result = p.delete_sdcard_file(path)
+            _, result = _guarded_delete(pname, p, path)
             log.debug("delete_sdcard_file: → ok")
             return jsonify(result)
+        except print_admission.Refused as r:
+            return _err(f"{r.code}: {r.detail}", code=HTTPStatus.BAD_REQUEST)
         except Exception as e:
             log.error("delete_sdcard_file: error: %s", e, exc_info=True)
             return _err(str(e))
@@ -1754,18 +1766,25 @@ def _build_app():
         """Rename or move an SD card file. ?src=<path>&dest=<path>
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+        Print admissions for src and dest are dropped first. Renaming a non-printable name to a
+        .3mf/.gcode name is refused with 403 (it would create an unprepared job).
         """
         log.debug("rename_sdcard_file: called")
-        p, _ = _get_printer(_rargs())
+        p, pname = _get_printer(_rargs())
         if p is None:
             return _err("no printer")
+        import print_admission
+        from tools.files import _guarded_rename
         try:
             src = _rargs().get("src", "")
             dest = _rargs().get("dest", "")
             log.debug("rename_sdcard_file: src=%s dest=%s", src, dest)
-            result = p.rename_sdcard_file(src, dest)
+            _, _, result = _guarded_rename(pname, p, src, dest)
             log.debug("rename_sdcard_file: → ok")
             return jsonify(result)
+        except print_admission.Refused as r:
+            code = HTTPStatus.FORBIDDEN if r.code == "rename_creates_job" else HTTPStatus.BAD_REQUEST
+            return _err(f"{r.code}: {r.detail}", code=code)
         except Exception as e:
             log.error("rename_sdcard_file: error: %s", e, exc_info=True)
             return _err(str(e))
@@ -1794,11 +1813,15 @@ def _build_app():
         """⚠️ Upload a local file to the printer SD card. ?src=<filename_in_uploads>&dest=<remote_path>
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
+        Printable jobs (.3mf/.gcode on either side) are refused with 403: a file in the uploads
+        directory is never a prepared job. Upload prepared jobs with the MCP upload_file tool.
         """
         log.debug("upload_file_to_printer: called")
-        p, _ = _get_printer(_rargs())
+        p, pname = _get_printer(_rargs())
         if p is None:
             return _err("no printer")
+        import print_admission
+        from tools.files import _guarded_upload
         try:
             src = _rargs().get("src", "")
             dest = _rargs().get("dest", "")
@@ -1806,9 +1829,12 @@ def _build_app():
             if local is None:
                 return _err("invalid src filename", HTTPStatus.BAD_REQUEST)
             log.debug("upload_file_to_printer: src=%s dest=%s", local, dest)
-            result = p.upload_sdcard_file(str(local), dest)
+            result = _guarded_upload(pname, p, str(local), dest)["contents"]
             log.debug("upload_file_to_printer: → ok")
             return jsonify(result)
+        except print_admission.Refused as r:
+            code = HTTPStatus.FORBIDDEN if r.code in ("job_not_prepared", "remote_not_project") else HTTPStatus.BAD_REQUEST
+            return _err(f"{r.code}: {r.detail}", code=code)
         except Exception as e:
             log.error("upload_file_to_printer: error: %s", e, exc_info=True)
             return _err(str(e))
@@ -2068,6 +2094,9 @@ def _build_app():
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
         ⛔ BLOCKED during active prints (gcode_state RUNNING or PREPARE) — returns 409.
+        ⛔ Maintenance G-code only (the MCP send_gcode allowlist, enforced on the MQTT publish
+        path): extrusion, SD-card file commands, macros and unknown commands return 403 and
+        nothing is sent. 503 when the write is refused for another reason (telemetry not live).
         """
         log.debug("send_gcode: called")
         p, pname = _get_printer(_rargs())
@@ -2077,12 +2106,19 @@ def _build_app():
         blocked = check_active_print_guard(p, pname or "unknown", "send_gcode")
         if blocked:
             return _err(blocked["error"], code=HTTPStatus.CONFLICT)
+        import print_admission
+        from reliability import PublishRejected
         try:
             gcode = _rargs().get("gcode", "").replace("|", "\n")
             log.debug("send_gcode: gcode=%s", repr(gcode[:80]))
+            refusal = print_admission.gcode_refusal(gcode)  # the publish path enforces it again
+            if refusal:
+                return _err(f"{refusal}; nothing was sent", code=HTTPStatus.FORBIDDEN)
             p.send_gcode(gcode)
             log.debug("send_gcode: → ok")
             return _ok()
+        except PublishRejected as e:
+            return _err(str(e), code=HTTPStatus.SERVICE_UNAVAILABLE)
         except Exception as e:
             log.error("send_gcode: error: %s", e, exc_info=True)
             return _err(str(e))
@@ -2092,9 +2128,10 @@ def _build_app():
         """⚠️ Send a raw MQTT command JSON to the printer's request topic. ?command_json=<json>
 
         ⚠️ WRITE OPERATION — requires explicit user confirmation before calling.
-        ⚠️ LAST-RESORT TOOL. Bypasses all safety checks. Incorrect commands can damage
-        prints, trigger hardware faults, or put the printer into an unrecoverable state.
-        command_json must be a valid JSON string matching the Bambu Lab MQTT command schema.
+        ⚠️ LAST-RESORT TOOL. Incorrect commands can damage prints or trigger hardware faults.
+        command_json must be one allowlisted non-start command (the MCP send_mqtt_command
+        allowlist); print starts, file references, G-code and unlisted commands return 403
+        and nothing is sent.
         """
         log.debug("send_mqtt_command: called")
         p, _ = _get_printer(_rargs())
@@ -2102,8 +2139,11 @@ def _build_app():
             return _err("no printer")
         try:
             import json as _json
+            import print_admission
             command_json = _rargs().get("command_json", "")
-            _json.loads(command_json)  # validate JSON before sending
+            refusal = print_admission.raw_command_refusal(_json.loads(command_json))
+            if refusal:
+                return _err(f"raw_command_refused: {refusal}", code=HTTPStatus.FORBIDDEN)
             log.debug("send_mqtt_command: command=%s", command_json[:80])
             p.send_anything(command_json)
             log.debug("send_mqtt_command: → ok")

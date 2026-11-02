@@ -47,9 +47,35 @@ Replay a failure:
   delivery result and no command replay. Killing the MCP process and starting
   its replacement must leave the same HTTP client usable.
 * A sliced 3MF without preview images is downloaded through real FTPS and parsed
-  by the installed dependency. Corrupt files and missing plates cannot start a
-  print. External-holder loading and print mapping are checked in received MQTT
+  by the installed dependency. External-holder loading is checked in received MQTT
   packets; requests without permission and writes during a print are refused.
+* Print admission (`docs/print-admission.md`). The server runs the fixed
+  `fixture_preparer.py` as its configured preparer process. Invalid part names never
+  reach it; a failed exit, a hang (killed at the timeout), a missing, old-schema,
+  still-running, extra-part, problem-carrying or geometry-failed report, a forged
+  job hash and a symlinked job admit nothing, and their job files cannot be
+  uploaded. A caller's own PASS report, an exact copy of a prepared job, a job edited
+  after preparation and a valid sliced file already on the card are refused before
+  any STOR or start packet. Raw MQTT starts, `gcode_file`, SD-card G-code (M23/M24,
+  M28, M32), extrusion (including `g1e5`), macros and tool changes are refused on the
+  publish path; maintenance G-code and an allowlisted pause still arrive. For a
+  prepared job, a missing or nonfinite nozzle report, the wrong plate or bed type and a file replaced on the card are
+  refused; the card is re-read and exactly one `project_file` arrives with the
+  admitted file, plate, external mapping, the prepared bed type (for `auto`) and
+  exactly the job's MD5; a repeat is refused. A report without a target, a target
+  not qualified for the policy (X1 Carbon) and a job whose G-code header contradicts
+  the target admit nothing; a valid but different plate (`cool_plate`), a 0.6 mm
+  nozzle report and a nozzle not reported since the reconnect are refused; a P1S job
+  uploaded to a server for an A1 serial is refused as the wrong model. The simulated
+  printer reports its serial topic and nozzle as a P1S does.
+  Rename, overwrite by a differently-cased rename, delete and removal by another
+  client (`remote_file_missing`) revoke admission. A
+  start whose delivery is unknown (full socket) is not replayed and cannot be
+  repeated. A SIGKILLed server forgets every admission, and a replacement with a
+  world-writable preparer refuses without running it.
+  The fixture renders, slices and checks no geometry: it only produces the outcomes
+  a real preparer can, at the same process boundary. The real Soyrack renderer and
+  slicer are tested in that repository.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.

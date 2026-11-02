@@ -24,6 +24,9 @@ What this module adds, without editing bpm (``ReliablePrinter`` subclasses ``Bam
   thread is alive, paho is connected and telemetry is live. The paho return code is checked,
   and completion of the socket write is bounded. Nothing is retried or queued for later:
   paho 2.1 drops unsent QoS 0 packets on reconnect, and a refused write raises.
+  Every write first passes print_admission.publish_refusal(): a print start needs the one-shot
+  ticket of an admitted print_file call, and file starts, SD-card or extruding G-code are
+  refused whichever tool, route or internal caller published them.
 * Supervisor thread. It restarts a dead session with capped exponential backoff, requests
   pushall (read-only) when telemetry is stale or incomplete, forces a reconnect when a live
   socket stays silent, and never starts a replacement while the old loop thread is alive.
@@ -44,6 +47,8 @@ from bpm.bambucommands import ANNOUNCE_PUSH, ANNOUNCE_VERSION
 from bpm.bambuprinter import BambuPrinter
 from bpm.bambuproject import get_3mf_entry_by_name, get_project_info
 from bpm.bambutools import ServiceState
+
+import print_admission
 
 log = logging.getLogger(__name__)
 
@@ -158,8 +163,9 @@ class _GuardedClient:
             if real is not p._client or not real.is_connected():
                 return _NotSent()
             return real.publish(topic, payload, qos, retain, properties)
-        # A printer write: refuse unless this exact session is demonstrably live.
-        reason = p._write_refusal(real)
+        # A printer write. Admission policy first (it also consumes a print_file start ticket),
+        # then refuse unless this exact session is demonstrably live.
+        reason = print_admission.publish_refusal(payload) or p._write_refusal(real)
         if reason:
             _record_outcome({"status": "rejected", "reason": reason})
             raise PublishRejected(f"printer write not sent: {reason}")
@@ -233,6 +239,9 @@ class ReliablePrinter(BambuPrinter):
         # Kept apart from last_error, which the disconnect that follows a refusal overwrites.
         self._rel_connect_error: str | None = None
         self._rel_last_pushall_req = 0.0
+        # nozzle_diameter exactly as the printer reported it since this connection began; print
+        # admission matches a job to it. Never carried across a reconnect (the nozzle may change).
+        self._rel_nozzle: str | None = None
 
     def _rel_mark_incomplete(self, why: str) -> None:
         with self._rel_lock:
@@ -249,6 +258,8 @@ class ReliablePrinter(BambuPrinter):
         if "nozzle_temper" in status or "device" in status:
             keys.add("nozzle")
         with self._rel_lock:
+            if "nozzle_diameter" in status:
+                self._rel_nozzle = str(status["nozzle_diameter"])
             self._rel_covered |= keys
             if self._rel_baseline_at is None and {"gcode_state", "bed", "nozzle"} <= self._rel_covered:
                 self._rel_baseline_at = time.monotonic()
@@ -339,6 +350,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_disconnected_at = None
                 self._rel_covered = set()
                 self._rel_baseline_at = None
+                self._rel_nozzle = None
             if down_since is not None:
                 log.warning("ReliablePrinter: MQTT reconnected after %.0fs", time.monotonic() - down_since)
             if self.service_state != ServiceState.PAUSED:
@@ -353,6 +365,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_disconnected_at = time.monotonic()
                 self._rel_covered = set()
                 self._rel_baseline_at = None
+                self._rel_nozzle = None
                 self._rel_last_error = f"mqtt disconnected: {reason_code}"
             if was_connected:  # once per lost connection, not per failed retry
                 log.warning("ReliablePrinter: MQTT disconnected (%s); telemetry not live until it reconnects",
@@ -366,6 +379,11 @@ class ReliablePrinter(BambuPrinter):
             self._rel_connect_error = message
         if changed:  # each distinct cause once, not every reconnect attempt
             log.warning("ReliablePrinter: %s", message)
+
+    def reported_nozzle_diameter(self) -> str | None:
+        """The nozzle_diameter the printer reported on this connection, or None (not yet / reconnected)."""
+        with self._rel_lock:
+            return self._rel_nozzle
 
     def _request_pushall(self, client=None) -> bool:
         """Read-only full-state request. Safe to repeat; never a printer write."""
@@ -586,6 +604,7 @@ class ReliablePrinter(BambuPrinter):
                 "last_error": self._rel_last_error,
                 "connect_error": self._rel_connect_error,
                 "session_generation": self._rel_generation,
+                "reported_nozzle_diameter": self._rel_nozzle,
             }
             connect_error = self._rel_connect_error
         thread = self._mqtt_client_thread

@@ -521,7 +521,7 @@ def get_plate_thumbnail(
     plates or ``open_plate_layout`` for an annotated single-plate view; returning a raw
     ``data_uri`` to a human in a chat or terminal is never the right choice. For
     ``print_file`` pre-flight and print job prep, always use ``open_plate_viewer``, never
-    this tool (see the confirmation gate in ``print_file``).
+    this tool (see ``print_file``).
 
     Args:
         name: Configured printer name (see ``get_configured_printers``).
@@ -577,7 +577,7 @@ def get_plate_topview(
     for all plates or ``open_plate_layout`` for an annotated single-plate view; returning a
     raw ``data_uri`` to a human in a chat or terminal is never the right choice. For
     ``print_file`` pre-flight and print job prep, always use ``open_plate_viewer``, never
-    this tool (see the confirmation gate in ``print_file``).
+    this tool (see ``print_file``).
 
     Args:
         name: Configured printer name (see ``get_configured_printers``).
@@ -668,6 +668,101 @@ def _get_plate_image(
         return {"error": f"Error retrieving plate image: {e}"}
 
 
+def prepare_print_job(part: str) -> dict:
+    """
+    Prepare one part for printing: run the server's configured preparer and admit the job it
+    produces only if that run passes.
+
+    WHEN to use: STEP 1 of every print. Only a job returned here can be uploaded as a printable
+    file (``upload_file``) and then started (``print_file``). No caller-supplied report, path
+    or flag can stand in for it.
+
+    The server runs the fixed command an operator configured in its own environment
+    (``BAMBU_PREFLIGHT_COMMAND_JSON``) with a new output directory it chose and ``part``; for
+    the Soyrack guide that preparer renders the CAD, slices it with the installed Bambu Studio
+    and runs its geometry and support checks. The job is admitted only when the process exits 0
+    and its ``preflight.json`` says ``schema_version`` 2, ``geometry_policy_version`` 1,
+    ``pass`` true, ``state`` complete, exactly this part with no problems, ``geometry.pass``
+    true from policy 1, and a ``target`` (printer_model, one nozzle_diameter, plate_type)
+    qualified for that policy (a single-nozzle Bambu Lab P1S today) which the job's own plate
+    G-code also declares; and the job's SHA-256 matches what the server computes itself. It
+    sends nothing to any printer.
+
+    Sibling disambiguation: ``prepare_print_job`` creates the admitted job on this host;
+    ``upload_file`` copies it to the SD card; ``print_file`` starts it.
+
+    Args:
+        part: One part name known to the preparer, matching ``^[a-z0-9][a-z0-9_-]{0,63}$``
+            (for example ``drive_tray``).
+
+    Returns:
+        Success: ``{"success": True, "receipt_id", "part", "job_path", "sha256", "md5", "size",
+        "plates", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
+        "run_dir", "report_sha256", "prepared_at", "report": <summary copied from the
+        preparer's report, incl. command, command_sha256, slicer, minutes, grams, watch>,
+        "valid_until": "server restart", "next": <the upload call to make>}``. Pass
+        ``job_path`` unchanged as ``upload_file``'s ``local_path``.
+        Refusals are ``{"error": code, "detail": str, ...}`` with code ``invalid_part``,
+        ``preflight_unconfigured``, ``preflight_config_invalid``, ``preflight_command_untrusted``,
+        ``preparation_in_progress``, ``preflight_failed`` / ``preflight_timeout`` (with ``log``,
+        ``log_tail`` and the preparer's ``report`` problems when present) or
+        ``preflight_rejected`` (the report or job broke an admission rule).
+
+    Notes:
+        Receipts live in server memory only: a server restart forgets them, so prepare again.
+        A job file changed after preparation is refused at upload. Runs are kept under
+        ``~/.bambu-mcp/preflight/`` (newest 100). One preparation runs at a time.
+    """
+    log.debug("prepare_print_job: called for part=%s", part)
+    import print_admission
+    try:
+        return print_admission.prepare(part)
+    except print_admission.Refused as r:
+        log.warning("prepare_print_job: %s refused: %s", part, r)
+        return r.as_dict()
+
+
+def _guarded_upload(name: str, printer, local_path: str, remote_path: str) -> dict:
+    """Upload under the admission rules (shared with POST /api/upload_file_to_printer).
+
+    Raises print_admission.Refused when refused; returns the success payload otherwise.
+    """
+    import shutil
+    import print_admission as pa
+    with pa.file_lock(name):
+        if not (pa.is_job_name(local_path) or pa.is_job_name(remote_path)):
+            # Not a printable job either way. It cannot become one later: rename refuses a
+            # job-like destination for a non-job source, and print_file needs an admission.
+            remote = pa.normalize_remote(remote_path)
+            return {"success": True, "remote_path": remote, "contents": printer.upload_sdcard_file(local_path, remote)}
+        receipt, remote, snapshot, tmpdir = pa.snapshot_for_upload(local_path, remote_path)
+        try:
+            pa.drop(name, remote, "replaced by a new upload")
+            warning = None
+            try:
+                contents = printer.upload_sdcard_file(snapshot, remote)
+            except Exception as exc:
+                # The transfer may have finished before the metadata parse or listing failed.
+                contents, warning = None, f"{type(exc).__name__}: {exc}"
+                try:
+                    sha, _, _, _, verify_dir = pa.remote_digest(printer, remote)
+                    shutil.rmtree(verify_dir, ignore_errors=True)
+                except Exception as verify_exc:
+                    sha, warning = None, f"{warning}; verification download failed: {verify_exc}"
+                if sha != receipt.sha256:
+                    raise pa.Refused("upload_failed",
+                                     f"The upload of {remote} did not complete ({warning}). The card may hold a "
+                                     "partial or old file, which is NOT admitted. Run upload_file again.")
+            admitted = pa.bind(name, remote, receipt)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    out = {"success": True, "remote_path": remote, "contents": contents, "admission": admitted.public()}
+    if warning:
+        out["warning"] = (f"After the transfer bambu reported {warning}; the uploaded bytes were downloaded "
+                          "again and match the prepared job, so it is admitted.")
+    return out
+
+
 def upload_file(
     name: str,
     local_path: str,
@@ -675,14 +770,25 @@ def upload_file(
     user_permission: bool = False,
 ) -> dict:
     """
-    Upload a local file to the printer's SD card.
+    Upload a local file to the printer's SD card; a printable job only if it was prepared by
+    ``prepare_print_job``.
 
-    WHEN to use: put a file from this host onto the printer's SD card, for example a sliced
-    .3mf you want to print, or to replace a file already on the card.
+    WHEN to use: STEP 2 of a print: copy the ``job_path`` returned by ``prepare_print_job`` to
+    the card, then call ``print_file`` on the same remote path. Also copies non-printable
+    files (anything not ending ``.3mf`` or ``.gcode``) for diagnostics.
 
     WRITE GUARD: writes the file to the printer's SD card over FTPS, replacing any existing
     file at that remote path. With ``user_permission`` False the tool changes nothing and
     returns the ``{"error": ...}`` refusal naming that consequence.
+
+    ADMISSION: a printable job is any upload whose local or remote name ends ``.3mf`` or
+    ``.gcode`` (case-insensitive). It is accepted only when ``local_path`` is the ``job_path``
+    of a prepared job in this server's lifetime and still has the prepared SHA-256: the server
+    copies it to a private snapshot while hashing and uploads exactly those bytes to a remote
+    path ending ``.3mf``. Then that remote path is bound to the job for ONE ``print_file``
+    start. Any earlier binding for the same path is dropped before the transfer, and a failed
+    transfer binds nothing. Arbitrary sliced files, edited jobs and jobs from a previous server
+    run are refused; there is no override.
 
     Sibling disambiguation: ``upload_file`` copies a file from this host to the printer;
     ``download_file`` copies the other way, from the printer to this host.
@@ -690,25 +796,31 @@ def upload_file(
 
     Args:
         name: Configured printer name (see ``get_configured_printers``).
-        local_path: Full path of the file on this host to upload. It is not constrained to any
-            directory: any file readable by this host can be copied to the printer's SD card.
-        remote_path: Full destination path on the printer's SD card.
+        local_path: Full path of the file on this host to upload. For a printable job, the
+            ``job_path`` from ``prepare_print_job``. Other files are not constrained to any
+            directory.
+        remote_path: Full destination path on the printer's SD card (a leading ``/`` is
+            added; ``.`` and ``..`` segments are refused). A prepared job needs a ``.3mf``
+            name, for example ``/drive_tray.gcode.3mf``.
         user_permission: Must be True to execute. Default False.
 
     Returns:
-        ``{"success": True, "remote_path": <remote_path>, "contents": <refreshed SD card
-        tree>}`` on success; ``contents`` is the printer library's SD card listing taken after
-        the upload. It is null when that listing failed; the upload itself succeeded either
-        way, so the tool still returns success. Errors are ``{"error": str}``: the
-        ``_permission_denied`` refusal when ``user_permission`` is False,
-        ``"Printer '<name>' not connected"``, or ``"Error uploading file: <exception>"``.
+        ``{"success": True, "remote_path": <normalized remote path>, "contents": <refreshed SD
+        card tree>}`` on success, plus ``"admission": {"receipt_id", "part", "remote_path",
+        "sha256", "plates"}`` for a prepared job. ``contents`` is the printer library's SD card
+        listing taken after the upload; null when that listing failed. A prepared job whose
+        post-transfer step failed is downloaded again and admitted only if its bytes match,
+        with a ``"warning"``. Errors are ``{"error": str}`` (permission refusal, ``"Printer
+        '<name>' not connected"``, ``"Error uploading file: <exception>"``) or ``{"error":
+        code, "detail": str}`` with code ``job_not_prepared``, ``job_modified``,
+        ``remote_not_project``, ``invalid_remote_path``, ``upload_failed`` or
+        ``file_operation_busy``.
 
     Notes:
-        If ``local_path`` ends in ``.3mf``, the project metadata is parsed and cached after the
-        transfer, and the SD card is then re-listed. A failure in either step (for example an
-        unsliced .3mf lacking ``Metadata/slice_info.config``) surfaces as ``"Error uploading
-        file: ..."`` even though the file is ALREADY on the card; check with ``get_file_info``
-        before retrying.
+        A ``.3mf`` upload is parsed and cached by the printer library after the transfer, and
+        the SD card is then re-listed. For a non-job file a failure there surfaces as ``"Error
+        uploading file: ..."`` even though the file is ALREADY on the card; check with
+        ``get_file_info`` before retrying.
     """
     log.debug("upload_file: called for name=%s local_path=%s remote_path=%s user_permission=%s", name, local_path, remote_path, user_permission)
     if not user_permission:
@@ -720,12 +832,14 @@ def upload_file(
     if printer is None:
         log.warning("upload_file: printer not connected: %s", name)
         return _no_printer(name)
+    import print_admission
     try:
-        log.debug("upload_file: calling printer.upload_sdcard_file for %s", name)
-        result = printer.upload_sdcard_file(local_path, remote_path)
-        log.debug("upload_file: success for %s remote_path=%s", name, remote_path)
-        log.debug("upload_file: → remote_path=%s", remote_path)
-        return {"success": True, "remote_path": remote_path, "contents": result}
+        result = _guarded_upload(name, printer, local_path, remote_path)
+        log.debug("upload_file: → remote_path=%s admission=%s", result["remote_path"], result.get("admission"))
+        return result
+    except print_admission.Refused as r:
+        log.warning("upload_file: refused for %s: %s", name, r)
+        return r.as_dict()
     except Exception as e:
         log.error("upload_file: error for %s: %s", name, e, exc_info=True)
         return {"error": f"Error uploading file: {e}"}
@@ -759,14 +873,17 @@ def download_file(
     Args:
         name: Configured printer name (see ``get_configured_printers``).
         remote_path: Full path of the file on the printer's SD card.
-        local_path: Destination path on this host.
+        local_path: Destination path on this host. Paths inside the server's prepared-job
+            store (``~/.bambu-mcp/preflight/``) are refused, so a download can never replace
+            a prepared job or its report.
         user_permission: Must be True to execute. Default False.
 
     Returns:
         ``{"success": True, "remote_path": <remote_path>, "local_path": <local_path>}`` on
         success. Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
         ``user_permission`` is False, ``"Printer '<name>' not connected"``, or
-        ``"Error downloading file: <exception>"``.
+        ``"Error downloading file: <exception>"``; or ``{"error": "local_path_reserved",
+        "detail": str}`` for a destination inside the prepared-job store.
     """
     log.debug("download_file: called for name=%s remote_path=%s local_path=%s user_permission=%s", name, remote_path, local_path, user_permission)
     if not user_permission:
@@ -774,6 +891,11 @@ def download_file(
         return {"error": _permission_denied(
             "This would write the SD card file to the local path on this host, overwriting any file already there."
         )}
+    import print_admission
+    if print_admission.inside_store(local_path):
+        return {"error": "local_path_reserved",
+                "detail": f"{local_path} is inside the server's prepared-job store; choose another destination. "
+                          "Nothing was downloaded."}
     printer = session_manager.get_printer(name)
     if printer is None:
         log.warning("download_file: printer not connected: %s", name)
@@ -817,12 +939,17 @@ def delete_file(
         user_permission: Must be True to execute. Default False.
 
     Returns:
-        ``{"success": True, "remote_path": <remote_path>, "contents": <SD card tree>}`` on
-        success; ``contents`` is the printer library's cached SD card tree with the deleted
-        entry removed (null if the cache is empty: never populated, or cleared by a listing the
-        library reported as failed). Errors are ``{"error": str}``:
+        ``{"success": True, "remote_path": <normalized remote path>, "contents": <SD card
+        tree>}`` on success; ``contents`` is the printer library's cached SD card tree with the
+        deleted entry removed (null if the cache is empty: never populated, or cleared by a
+        listing the library reported as failed). Errors are ``{"error": str}``:
         the ``_permission_denied`` refusal when ``user_permission`` is False,
-        ``"Printer '<name>' not connected"``, or ``"Error deleting file: <exception>"``.
+        ``"Printer '<name>' not connected"``, or ``"Error deleting file: <exception>"``; or
+        ``{"error": "invalid_remote_path" | "file_operation_busy", "detail": str}``.
+
+    Notes:
+        A print admission (see ``upload_file``) for the deleted file, or for anything under a
+        deleted folder, is dropped before the FTPS delete, even if the delete then fails.
     """
     log.debug("delete_file: called for name=%s remote_path=%s user_permission=%s", name, remote_path, user_permission)
     if not user_permission:
@@ -834,19 +961,30 @@ def delete_file(
     if printer is None:
         log.warning("delete_file: printer not connected: %s", name)
         return _no_printer(name)
+    import print_admission
     try:
-        if remote_path.endswith("/"):
-            log.debug("delete_file: calling printer.delete_sdcard_folder for %s", name)
-            result = printer.delete_sdcard_folder(remote_path)
-        else:
-            log.debug("delete_file: calling printer.delete_sdcard_file for %s", name)
-            result = printer.delete_sdcard_file(remote_path)
-        log.debug("delete_file: success for %s remote_path=%s", name, remote_path)
-        log.debug("delete_file: → remote_path=%s", remote_path)
-        return {"success": True, "remote_path": remote_path, "contents": result}
+        path, result = _guarded_delete(name, printer, remote_path)
+        log.debug("delete_file: → remote_path=%s", path)
+        return {"success": True, "remote_path": path, "contents": result}
+    except print_admission.Refused as r:
+        return r.as_dict()
     except Exception as e:
         log.error("delete_file: error for %s: %s", name, e, exc_info=True)
         return {"error": f"Error deleting file: {e}"}
+
+
+def _guarded_delete(name: str, printer, remote_path: str):
+    """Delete a file or folder, dropping admissions it invalidates first. Returns (path, tree).
+
+    Shared with DELETE /api/delete_sdcard_file. Raises print_admission.Refused.
+    """
+    import print_admission as pa
+    path = pa.normalize_remote(remote_path)
+    with pa.file_lock(name):
+        pa.drop(name, path, "deleted")
+        if path.endswith("/"):
+            return path, printer.delete_sdcard_folder(path)
+        return path, printer.delete_sdcard_file(path)
 
 
 def create_folder(
@@ -1100,15 +1238,17 @@ def _resolve_ams_mapping_from_spools(
     return wire, matches, unmatched
 
 
-def _resolve_print_mapping(name: str, printer, file_path: str, plate_num: int) -> dict:
+def _resolve_print_mapping(name: str, printer, file_path: str, plate_num: int, info=None) -> dict:
     """Resolve the ams_mapping a print of file_path/plate_num would use, from the spools
     the printer last reported. Never prints. Returns the resolution payload; when the
     print could not proceed on it the payload also carries an "error" message.
+    ``info``: project metadata already parsed from verified bytes (print_file); read otherwise.
     """
     import json
     try:
-        from bpm.bambuproject import get_project_info as _get_project_info
-        info = _get_project_info(file_path, printer, plate_num=plate_num)
+        if info is None:
+            from bpm.bambuproject import get_project_info as _get_project_info
+            info = _get_project_info(file_path, printer, plate_num=plate_num)
     except Exception as e:
         log.warning("resolve_print_mapping: could not read project metadata for %s: %s", file_path, e)
         return {
@@ -1164,10 +1304,10 @@ def preview_ams_mapping(name: str, file_path: str, plate_num: int = 1) -> dict:
     Resolve, WITHOUT printing, the ams_mapping that print_file would send for a .3mf plate,
     from the spools the printer last reported loaded.
 
-    WHEN to use: STEP 1 of the ``print_file`` confirmation gate. Call it, then show the
-    result in the summary: each filament to its tray_id with the spool it matched, its colour
-    distance, and a BPA match label (Excellent Match / Good Match / Type Match / Color Match
-    Only / Poor Match).
+    WHEN to use: before ``print_file`` when the AMS feeds the print. It returns the exact
+    mapping ``print_file`` will send: report each filament's tray_id, the spool it matched, its
+    colour distance and the BPA match label (Excellent Match / Good Match / Type Match / Color
+    Match Only / Poor Match).
 
     Sibling disambiguation: ``preview_ams_mapping`` is read-only and never prints;
     ``print_file`` runs the same resolution and then starts the physical print.
@@ -1223,38 +1363,58 @@ def print_file(
     user_permission: bool = False,
 ) -> dict:
     """
-    Send the command to start printing a .3mf file already stored on the printer's SD card.
+    Start printing a job that ``prepare_print_job`` prepared and ``upload_file`` uploaded.
 
-    WHEN to use: only as the last step, after the confirmation gate in Notes (STEP 0 to
-    STEP 3) has been completed in a single turn and the user has given an explicit go-ahead
-    after seeing the complete summary. Never call it on a partial confirmation.
+    WHEN to use: STEP 3 of a print, after ``prepare_print_job`` and ``upload_file``, when the
+    user has asked for this print. That request is the authorization for the task and stays
+    valid; it does not need to be repeated per step or parameter. What may start is enforced
+    by the server (ADMISSION below), not by a conversational gate.
 
     WRITE GUARD: starts a physical print on the named printer, which heats, moves and
     extrudes immediately. Once started the job can only be paused (``pause_print``) or
     cancelled (``stop_print``); it cannot be recalled. With ``user_permission`` False the tool
     changes nothing and returns the ``{"error": ...}`` refusal naming that consequence.
-    Separately from the guard, the tool is BLOCKED while the printer's LAST REPORTED
-    gcode_state is RUNNING or PREPARE (an active-print guard that ``user_permission=True``
-    cannot override). That block reads cached telemetry and does not fire when the state is
-    empty or unreadable, as it is until the first status report after a session or daemon
-    restart.
+    Separately from the guard, the tool is BLOCKED while the printer's reported gcode_state is
+    RUNNING or PREPARE (an active-print guard that ``user_permission=True`` cannot override).
+    Like every printer write it is also refused unless telemetry is live (a complete, current
+    state report on the current connection), so missing or stale state never lets a start
+    through.
+
+    ADMISSION: only a remote path that ``upload_file`` bound to a prepared job in this server's
+    lifetime can start, once. Immediately before starting, the server downloads the file over
+    FTPS and requires the prepared SHA-256, reads the plate metadata from those verified
+    bytes, and holds the SD-card lock so this server's uploads, renames and deletes cannot run
+    in between. The admission is consumed before the start command is published, so an
+    uncertain publish is never repeated: start again only after a new ``upload_file`` (the
+    prepared job stays valid; nothing is re-sliced). A file already on the card, a replaced,
+    renamed, deleted or modified file, another plate, and anything after a server restart are
+    refused before any command is sent. There is no override.
+    The printer must also be the job's prepared target (``target`` from ``prepare_print_job``):
+    the same model, derived from the serial number the live session answers on (unknown
+    refuses; the configured name is never used), one nozzle, and the prepared nozzle diameter
+    as the printer reported it on the current connection. The start names the prepared plate
+    type. Software cannot sense the plate or filament physically on the printer; that remains
+    an observation for the camera or a person.
 
     Sibling disambiguation: ``print_file`` starts the print; ``preview_ams_mapping`` resolves
     the same ams_mapping without printing and is the read-only step before it.
+    ``prepare_print_job`` and ``upload_file`` are the two steps that must come first.
     ``get_project_info`` reads the plate's filaments, and ``open_plate_viewer`` shows the
     plates to the human.
 
     Args:
         name: Configured printer name (see ``get_configured_printers``).
-        file_path: Full SD card path of the .3mf file to print.
-        plate_num: Plate to print (default 1).
-        bed_type: One of ``auto``, ``cool_plate``, ``eng_plate``, ``hot_plate``,
-            ``textured_plate`` (case-insensitive); any other value silently falls back to
-            ``auto``. ``cool_plate`` = smooth cold plate (PLA, TPU at low temp);
-            ``eng_plate`` = smooth engineering plate (PETG, PA, ABS); ``hot_plate`` = smooth
-            high-temp plate (ASA, PC); ``textured_plate`` = textured PEI surface (good
-            general-purpose adhesion); ``auto`` = let the printer decide based on the sliced
-            settings in the file. Default ``"auto"``.
+        file_path: SD card path that ``upload_file`` returned as ``remote_path`` (a leading
+            ``/`` is added).
+        plate_num: Plate to print (default 1); it must be a plate of the prepared job.
+        bed_type: ``auto`` (default) names the plate the job was prepared for (its
+            ``target.bed_type``) in the start packet. Naming that same plate is accepted; any
+            other of ``cool_plate``, ``eng_plate``, ``hot_plate``, ``textured_plate`` is refused
+            with ``bed_type_mismatch`` and an unknown name with ``invalid_bed_type``, both before
+            the admission is used (case-insensitive). ``cool_plate`` = smooth cold plate (PLA,
+            TPU at low temp); ``eng_plate`` = smooth engineering plate (PETG, PA, ABS);
+            ``hot_plate`` = smooth high-temp plate (ASA, PC); ``textured_plate`` = textured PEI
+            surface (good general-purpose adhesion).
         use_ams: True (default) loads filament from AMS slots, with the mapping resolved as
             described under ``ams_mapping``. False prints using only the external spool
             holder (single-colour prints without AMS): leave ``ams_mapping`` empty, and bpm
@@ -1287,22 +1447,35 @@ def print_file(
         ``{"success": True, ...}`` means the print command was PUBLISHED; the printer's
         acceptance and the job's start are not confirmed. Follow up with ``get_print_progress``
         or ``get_job_info``, and ``get_hms_errors`` if nothing starts. The full success shape
-        is ``{"success": True, "file_path": <file_path>, "plate_num": <plate_num>,
-        "bed_type": <resolved bed type name>, "use_ams": <bool>, "ams_mapping": <JSON string
-        sent, empty when none>, "matches": <list of per-filament match dicts from the
-        live-spool resolution, empty when ``ams_mapping`` was provided or ``use_ams`` is
-        False>}``. Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
+        is ``{"success": True, "status": "published_unconfirmed", "file_path": <normalized
+        path>, "plate_num": <plate_num>, "bed_type": <resolved bed type name>, "use_ams":
+        <bool>, "ams_mapping": <JSON string sent, empty when none>, "matches": <list of
+        per-filament match dicts from the live-spool resolution, empty when ``ams_mapping``
+        was provided or ``use_ams`` is False>, "admission": {"receipt_id", "part",
+        "remote_path", "sha256", "plates", "md5", "consumed": True}}``.
+        Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
         ``user_permission`` is False, ``"Printer '<name>' not connected"``, the active-print
         block ``"Blocked: '<name>' is currently <state>. ..."``, or
-        ``"Error starting print: <exception>"``. When the live-spool resolution fails, the
-        return is the resolution payload of ``preview_ams_mapping`` (``file_path``,
-        ``plate_num``, ``filaments``, ``resolved_ams_mapping``, ``ams_mapping_json``,
-        ``matches``, ``unmatched``, ``loaded_spools``, ``external_spools``) plus an
-        ``"error"`` message, or only ``{"error": str}`` when the project metadata could not be
-        read.
+        ``"Error starting print: <exception>"`` (then ``"admission": "consumed"``: upload
+        again before another attempt). Admission refusals, all sent before any command, are
+        ``{"error": code, "detail": str}`` with code ``print_not_admitted``,
+        ``plate_not_admitted``, ``remote_file_missing``, ``remote_file_mismatch``,
+        ``remote_verification_failed`` (FTPS error; the admission is kept), ``invalid_bed_type``,
+        ``bed_type_mismatch``, ``printer_model_unknown``, ``printer_model_mismatch``,
+        ``printer_not_qualified``, ``nozzle_unknown``, ``nozzle_mismatch``,
+        ``start_md5_unavailable``, ``invalid_ams_mapping``, ``print_metadata_unavailable``, ``filament_change_in_progress``, ``invalid_remote_path``
+        or ``file_operation_busy``. When the live-spool resolution fails, the return is the
+        resolution payload of ``preview_ams_mapping`` (``file_path``, ``plate_num``,
+        ``filaments``, ``resolved_ams_mapping``, ``ams_mapping_json``, ``matches``,
+        ``unmatched``, ``loaded_spools``, ``external_spools``) plus an ``"error"`` message, or
+        only ``{"error": str}`` when the project metadata could not be read; the admission is
+        kept for those.
 
     Notes:
-        Calls ``printer.print_3mf_file()`` with the given parameters.
+        Calls ``printer.print_3mf_file()`` with the given parameters. The MQTT publish guard
+        lets that one ``project_file`` packet through only when its file, plate, bed type,
+        options and md5 (exactly the MD5 of the verified bytes) match what this call verified;
+        any other start packet, from any tool or route, is refused there.
 
         tray_id encoding for ``ams_mapping``: ALWAYS derive from live telemetry (the spool's
         ams_id is the hardware chip_id from ``get_ams_units`` / ``get_spool_info``), NEVER
@@ -1323,47 +1496,15 @@ def print_file(
                  if AMS HT has ams_id=128, slot 0 -> tray_id=128.
         Always call ``get_project_info`` first to see which filaments the .3mf plate uses.
 
-        CONFIRMATION REQUIRED. DO NOT CALL THIS TOOL until all steps below are done IN A
-        SINGLE TURN. This tool starts a physical print that can only be paused or cancelled
-        afterwards, not recalled.
-
-        STEP 0, active-print guard: this tool is BLOCKED when the last reported gcode_state is
-        RUNNING or PREPARE (defense-in-depth, read from cached telemetry). Check
-        ``get_print_progress`` first if unsure.
-
-        STEP 1, gather everything first (no user interaction yet): call ``get_project_info``,
-        ``preview_ams_mapping``, ``get_ams_units`` and ``get_spool_info`` to collect all data
-        needed to build the complete summary before asking the user anything.
-        ``preview_ams_mapping`` is the mapping print_file will actually send. To show plate
-        visuals to the user, call ``open_plate_viewer(name, file_path)``; do NOT call
-        ``get_plate_thumbnail`` or ``get_plate_topview`` and embed the data_uri in the
-        response. Humans cannot see raw base64 in a terminal or chat context. Also look up
-        the stored preference for each sticky field with ``get_user_pref(name, key)``, keys
-        ``bed_leveling``, ``flow_calibration`` and ``timelapse``. A null value means nothing is
-        stored: use the factory default.
-        Factory defaults: bed_leveling=True, flow_calibration=False, timelapse=False. Label
-        each field "(your preference)" if the stored value differs from the factory default,
-        or "(default)" if it matches the factory default.
-
-        STEP 2, present ONE complete summary containing ALL of the following:
-          - Part name(s) and filament(s) from the project metadata
-          - bed_type (from metadata): ask whether it is correct for the plate physically on
-            the bed
-          - ams_mapping, from ``preview_ams_mapping``: each filament to a tray with its match
-            label; call out any "Type Match" (right material, wrong colour); ask whether it is
-            correct
-          - flow_calibration: show the stored value with its label; ask whether to run flow
-            calibration before printing
-          - timelapse: show the stored value with its label; ask whether to record a timelapse
-          - bed_leveling: show the stored value with its label; ask whether to run bed
-            leveling or skip it for speed
-
-        STEP 3, wait for explicit go-ahead AFTER the complete summary. Do NOT call print_file
-        after confirming individual parameters across separate turns. Confirming
-        flow_calibration, timelapse, or bed_leveling mid-conversation does NOT satisfy this
-        gate. The go-ahead must come in the turn immediately after the full summary is shown
-        with all six items visible. After print_file is called successfully, store the values
-        used with ``set_user_pref(name, key, value)`` for each of the three keys.
+        Workflow: ``prepare_print_job(part)`` -> ``upload_file`` with its ``job_path`` ->
+        ``print_file`` on the returned ``remote_path``. When the AMS feeds the print,
+        ``preview_ams_mapping`` returns the exact mapping this tool sends; report its match
+        labels (Type Match and Color Match Only especially, since software cannot sense the
+        loaded material). To show the plate to a person use ``open_plate_viewer``, never raw
+        thumbnails. For ``bed_leveling``, ``flow_calibration`` and ``timelapse`` use what the
+        user asked for, else their stored preference (``get_user_pref``; null means the
+        factory default: bed_leveling=True, flow_calibration=False, timelapse=False), and
+        store the values used with ``set_user_pref`` after a successful start.
     """
     log.debug("print_file: called for name=%s file_path=%s plate_num=%s bed_type=%s user_permission=%s", name, file_path, plate_num, bed_type, user_permission)
     if not user_permission:
@@ -1379,71 +1520,141 @@ def print_file(
     blocked = check_active_print_guard(printer, name, "print_file")
     if blocked:
         return blocked
+    import print_admission
     try:
-        from bpm.bambuproject import get_project_info as _read_project
-        from bpm.bambutools import PlateType
-        project = _read_project(file_path, printer, plate_num=plate_num)
-        if project is None or project.plate_num != plate_num or not project.metadata.get("filament"):
-            return {"error": "print_metadata_unavailable", "detail": "The requested plate and its filament must be verified before printing; no start command was sent."}
-        if bed_type and bed_type.upper() not in PlateType.__members__:
-            return {"error": "invalid_bed_type", "detail": bed_type}
-        bed_enum = (
-            PlateType[bed_type.upper()]
-            if bed_type and bed_type.upper() in PlateType.__members__
-            else PlateType.AUTO
-        )
-        matches: list[dict] = []
-        # "" and [] are the empty forms clients send for "no mapping" (BPA's own URL
-        # sends ams_mapping=); treat them as absent rather than as an empty mapping.
-        if ams_mapping not in (None, "", []):
-            # Coerce list → JSON string so print_3mf_file's json.loads() works
-            if isinstance(ams_mapping, list):
-                ams_mapping = __import__("json").dumps(ams_mapping)
-            resolved_ams_mapping = ams_mapping
-            use_ams = True
-            log.debug("print_file: using caller-provided ams_mapping: %s", ams_mapping)
-        else:
-            resolved_ams_mapping = ""
-            if use_ams:
-                res = _resolve_print_mapping(name, printer, file_path, plate_num)
-                if "error" in res:
-                    log.warning("print_file: refused for %s: %s", name, res["error"])
-                    return res
-                resolved_ams_mapping = res["ams_mapping_json"]
-                matches = res["matches"]
-        log.debug("print_file: calling printer.print_3mf_file for %s", name)
-        # Metadata/FTPS can take seconds. Recheck immediately before publishing.
-        blocked = check_active_print_guard(printer, name, "print_file")
-        if blocked:
-            return blocked
-        tray = getattr(printer.printer_state, "active_tray_state", "")
-        if getattr(tray, "name", str(tray)).upper() in ("LOADING", "UNLOADING"):
-            return {"error": "filament_change_in_progress", "detail": "Finish the filament change before starting a print."}
-        printer.print_3mf_file(
-            name=file_path,
-            plate=plate_num,
-            bed=bed_enum,
-            use_ams=use_ams,
-            ams_mapping=resolved_ams_mapping,
-            bedlevel=bed_leveling,
-            flow=flow_calibration,
-            timelapse=timelapse,
-        )
-        log.debug("print_file: print started for %s", name)
-        log.debug("print_file: → file=%s plate=%s bed_type=%s use_ams=%s ams_mapping=%s", file_path, plate_num, bed_enum.name, use_ams, resolved_ams_mapping)
-        return {
-            "success": True,
-            "status": "published_unconfirmed",
-            "file_path": file_path,
-            "plate_num": plate_num,
-            "bed_type": bed_enum.name,
-            "use_ams": use_ams,
-            "ams_mapping": resolved_ams_mapping,
-            "matches": matches,
-        }
+        path = print_admission.normalize_remote(file_path)
+        with print_admission.file_lock(name):
+            return _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mapping,
+                                   timelapse, bed_leveling, flow_calibration)
+    except print_admission.Refused as r:
+        log.warning("print_file: refused for %s: %s", name, r)
+        return r.as_dict()
+    except Exception as e:
+        # Only steps before the admission is consumed can raise out of _start_admitted.
+        log.error("print_file: error for %s: %s", name, e, exc_info=True)
+        return {"error": f"Error starting print: {e}", "detail": "No start command was sent."}
+
+
+def _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mapping, timelapse,
+                    bed_leveling, flow_calibration) -> dict:
+    """print_file under the SD-card lock: verify, consume the admission, publish once."""
+    import ftplib
+    import json
+    import shutil
+    import print_admission as pa
+    from bpm.bambuproject import cached_project_md5, get_project_info as _read_project
+    from bpm.bambutools import PlateType
+    from tools._guards import check_active_print_guard
+
+    admitted = pa.binding(name, path)
+    if admitted is None:
+        raise pa.Refused("print_not_admitted",
+                         f"{path} is not a prepared job uploaded by upload_file in this server's lifetime, or its "
+                         "admission was already used, replaced, renamed, deleted or lost in a server restart. "
+                         f"No command was sent. {pa._NEXT_STEP}")
+    if plate_num not in admitted.plates:
+        raise pa.Refused("plate_not_admitted", f"Plate {plate_num} is not a plate of the prepared job "
+                         f"(plates {list(admitted.plates)}). No command was sent.")
+    if bed_type and bed_type.upper() not in PlateType.__members__:
+        return {"error": "invalid_bed_type", "detail": bed_type}
+    # The start names the prepared plate ('auto' resolves to it; another plate is refused).
+    bed_enum = PlateType[pa.start_plate(admitted, bed_type)]
+    pa.check_printer(printer, admitted)
+    try:
+        sha, md5, _, verified, tmpdir = pa.remote_digest(printer, path)
+    except ftplib.error_perm as exc:
+        pa.drop(name, path, "missing on the card")
+        raise pa.Refused("remote_file_missing", f"{path} could not be read from the card ({exc}); its admission is "
+                         f"dropped. No command was sent. {pa._NEXT_STEP}") from None
+    except Exception as exc:
+        raise pa.Refused("remote_verification_failed",
+                         f"{path} could not be downloaded to verify it ({type(exc).__name__}: {exc}). No command was "
+                         "sent; the admission is kept, so print_file may be called again.") from None
+    try:
+        if sha != admitted.sha256:
+            pa.drop(name, path, "remote bytes differ from the prepared job")
+            raise pa.Refused("remote_file_mismatch",
+                             f"{path} on the card is not the prepared job (SHA-256 {sha}, expected "
+                             f"{admitted.sha256}); its admission is dropped. No command was sent. {pa._NEXT_STEP}")
+        # Plate metadata (filaments, extruders, md5) from the verified bytes only, never the cache.
+        project = _read_project(path, printer, plate_num=plate_num, local_file=verified, use_cached_list=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if project is None or project.plate_num != plate_num or not project.metadata.get("filament"):
+        return {"error": "print_metadata_unavailable", "detail": "The requested plate and its filament must be verified before printing; no start command was sent."}
+    # bambu puts its cached md5 for this path into the start packet; it must be the verified bytes'.
+    if cached_project_md5(printer, path, plate_num) != md5:
+        raise pa.Refused("start_md5_unavailable",
+                         f"bambu's metadata for {path} does not carry the verified MD5 {md5}, so the start packet "
+                         "could not name the verified file. No command was sent; the admission is kept.")
+    matches: list[dict] = []
+    # "" and [] are the empty forms clients send for "no mapping" (BPA's own URL
+    # sends ams_mapping=); treat them as absent rather than as an empty mapping.
+    if ams_mapping not in (None, "", []):
+        # Coerce list → JSON string so print_3mf_file's json.loads() works
+        if isinstance(ams_mapping, list):
+            ams_mapping = json.dumps(ams_mapping)
+        try:
+            ticket_mapping = tuple(int(x) for x in json.loads(ams_mapping))
+        except (TypeError, ValueError):
+            return {"error": "invalid_ams_mapping", "detail": f"{ams_mapping!r} is not a JSON array of tray ids; no start command was sent."}
+        resolved_ams_mapping = ams_mapping
+        use_ams = True
+        log.debug("print_file: using caller-provided ams_mapping: %s", ams_mapping)
+    else:
+        resolved_ams_mapping, ticket_mapping = "", None
+        if use_ams:
+            res = _resolve_print_mapping(name, printer, path, plate_num, info=project)
+            if "error" in res:
+                log.warning("print_file: refused for %s: %s", name, res["error"])
+                return res
+            resolved_ams_mapping = res["ams_mapping_json"]
+            ticket_mapping = tuple(res["resolved_ams_mapping"])
+            matches = res["matches"]
+    # Metadata/FTPS can take seconds. Recheck immediately before publishing.
+    blocked = check_active_print_guard(printer, name, "print_file")
+    if blocked:
+        return blocked
+    tray = getattr(printer.printer_state, "active_tray_state", "")
+    if getattr(tray, "name", str(tray)).upper() in ("LOADING", "UNLOADING"):
+        return {"error": "filament_change_in_progress", "detail": "Finish the filament change before starting a print."}
+    pa.check_printer(printer, admitted)  # again: the nozzle report may have changed during verification
+    ticket = pa.StartTicket(path=path, plate=plate_num, use_ams=bool(use_ams), ams_mapping=ticket_mapping,
+                            bed_type=bed_enum.name.lower(), bed_leveling=bool(bed_leveling),
+                            flow=bool(flow_calibration), timelapse=bool(timelapse), md5=md5)
+    if not pa.consume(name, admitted):
+        raise pa.Refused("print_not_admitted", f"The admission for {path} changed during verification. No command was sent.")
+    admission = {**admitted.public(), "md5": md5, "consumed": True}
+    log.debug("print_file: calling printer.print_3mf_file for %s", name)
+    try:
+        with pa.start_ticket(ticket):
+            printer.print_3mf_file(
+                name=path,
+                plate=plate_num,
+                bed=bed_enum,
+                use_ams=use_ams,
+                ams_mapping=resolved_ams_mapping,
+                bedlevel=bed_leveling,
+                flow=flow_calibration,
+                timelapse=timelapse,
+            )
     except Exception as e:
         log.error("print_file: error for %s: %s", name, e, exc_info=True)
-        return {"error": f"Error starting print: {e}"}
+        return {"error": f"Error starting print: {e}", "admission": "consumed",
+                "detail": "The admission was used for this attempt and is not retried. Check get_print_progress "
+                          "before anything else; to try again, run upload_file with the prepared job_path first."}
+    log.debug("print_file: → file=%s plate=%s bed_type=%s use_ams=%s ams_mapping=%s", path, plate_num, bed_enum.name, use_ams, resolved_ams_mapping)
+    return {
+        "success": True,
+        "status": "published_unconfirmed",
+        "file_path": path,
+        "plate_num": plate_num,
+        "bed_type": bed_enum.name,
+        "use_ams": use_ams,
+        "ams_mapping": resolved_ams_mapping,
+        "matches": matches,
+        "admission": admission,
+    }
 
 
 def _build_layout_uri(topimg_uri: str, objs: list, model_key) -> str:
@@ -1860,10 +2071,13 @@ def rename_sdcard_file(
         user_permission: Must be True to execute. Default False.
 
     Returns:
-        ``{"success": True, "src_path": <src_path>, "dest_path": <dest_path>}`` on success (no
-        listing is returned). Errors are ``{"error": str}``: the ``_permission_denied`` refusal
-        when ``user_permission`` is False, ``"Printer '<name>' not connected"``, or
-        ``"Error renaming file on '<name>': <exception>"``.
+        ``{"success": True, "src_path": <normalized src>, "dest_path": <normalized dest>}`` on
+        success (no listing is returned). Errors are ``{"error": str}``: the
+        ``_permission_denied`` refusal when ``user_permission`` is False, ``"Printer '<name>'
+        not connected"``, or ``"Error renaming file on '<name>': <exception>"``; or
+        ``{"error": code, "detail": str}`` with code ``rename_creates_job`` (a non-printable
+        name renamed to a ``.3mf``/``.gcode`` name), ``invalid_remote_path`` or
+        ``file_operation_busy``.
 
     Notes:
         This is an FTPS rename operation, not a copy: the file is moved or renamed in place and
@@ -1872,6 +2086,11 @@ def rename_sdcard_file(
         rename error even though the rename succeeded, while a listing the library reports as
         failed is not surfaced, because the rename it followed did succeed. Cached plate
         metadata keyed to the old path is not renamed.
+        Print admissions (see ``upload_file``) for the source, the destination and anything
+        under either as a folder are dropped before the rename: a renamed or overwritten job
+        must be uploaded again before ``print_file`` will start it. Renaming a file whose name
+        is not printable to a printable name is refused, because that would put an unprepared
+        job on the card.
     """
     log.debug("rename_sdcard_file: called for name=%s src=%s dest=%s user_permission=%s", name, src_path, dest_path, user_permission)
     if not user_permission:
@@ -1881,13 +2100,33 @@ def rename_sdcard_file(
     printer = session_manager.get_printer(name)
     if printer is None:
         return _no_printer(name)
+    import print_admission
     try:
-        printer.rename_sdcard_file(src_path, dest_path)
-        log.debug("rename_sdcard_file: renamed %s → %s on %s", src_path, dest_path, name)
-        return {"success": True, "src_path": src_path, "dest_path": dest_path}
+        src, dest, _ = _guarded_rename(name, printer, src_path, dest_path)
+        log.debug("rename_sdcard_file: renamed %s → %s on %s", src, dest, name)
+        return {"success": True, "src_path": src, "dest_path": dest}
+    except print_admission.Refused as r:
+        return r.as_dict()
     except Exception as e:
         log.error("rename_sdcard_file: error for %s: %s", name, e, exc_info=True)
         return {"error": f"Error renaming file on '{name}': {e}"}
+
+
+def _guarded_rename(name: str, printer, src_path: str, dest_path: str):
+    """Rename on the card, dropping admissions it invalidates first. Returns (src, dest, tree).
+
+    Shared with PATCH /api/rename_sdcard_file. Raises print_admission.Refused.
+    """
+    import print_admission as pa
+    src, dest = pa.normalize_remote(src_path), pa.normalize_remote(dest_path)
+    if pa.is_job_name(dest) and not pa.is_job_name(src):
+        raise pa.Refused("rename_creates_job",
+                         f"Renaming {src} to the printable name {dest} would create an unprepared job on the card. "
+                         "Nothing was renamed. Upload a job prepared by prepare_print_job instead.")
+    with pa.file_lock(name):
+        for path in dict.fromkeys((src, dest, src.rstrip("/") + "/", dest.rstrip("/") + "/")):
+            pa.drop(name, path, f"renamed {src} -> {dest}")
+        return src, dest, printer.rename_sdcard_file(src, dest)
 
 
 def get_current_job_project_info(name: str, include_images: bool = False) -> dict:

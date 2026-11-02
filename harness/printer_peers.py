@@ -1,11 +1,13 @@
 """Network-side FTPS and camera peers for MCP E2E acceptance.
 
 No production classes are imported or mocked. These peers implement the wire
-protocols and can reset a handshake or return an invalid camera header.
+protocols (the FTPS peer lists, sends, stores, deletes and renames files as the
+printer's server does) and can reset a handshake or return an invalid camera header.
 """
 import io
 import json
 import socket
+import ssl
 import struct
 import threading
 import zipfile
@@ -13,7 +15,9 @@ import zipfile
 from PIL import Image
 
 
-def project_archive():
+def project_archive(marker=None, printer_model="Bambu Lab P1S", nozzle="0.4", plate="Textured PEI Plate"):
+    """A sliced single-plate 3MF whose G-code header names its printer, nozzle and plate, as
+    Bambu Studio writes it. ``marker`` makes a distinct job (different bytes and hash)."""
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as z:
         z.writestr("Metadata/plate_1.json", json.dumps({
@@ -22,7 +26,11 @@ def project_archive():
           <metadata key="index" value="1"/><metadata key="filament_maps" value="1"/>
           <object identify_id="83" name="coupon_post.stl"/>
           <filament id="1" type="PETG" color="#000000"/></plate></config>''')
-        z.writestr("Metadata/plate_1.gcode", "; CONFIG_BLOCK_START\n; filament_type = PETG\n; CONFIG_BLOCK_END\n")
+        z.writestr("Metadata/plate_1.gcode", "; CONFIG_BLOCK_START\n; filament_type = PETG\n"
+                   f"; printer_model = {printer_model}\n; nozzle_diameter = {nozzle}\n"
+                   f"; curr_bed_type = {plate}\n; CONFIG_BLOCK_END\n")
+        if marker is not None:
+            z.writestr("Metadata/fixture_job.txt", str(marker))
     return out.getvalue()  # intentionally no thumbnail or top image
 
 
@@ -57,12 +65,14 @@ class FTPSPeer(Listener):
         self.reset = True
         self.resets = 0
         self.downloads = []
+        self.stores = []
         self.commands = []
         self.files = {"fixture-job.gcode.3mf":project_archive(), "broken.gcode.3mf":b"broken archive"}
         super().__init__(ctx, 990)
 
     def serve(self, raw):
         passive = None
+        rename_from = None
         if self.reset:
             self.resets += 1
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii",1,0))
@@ -109,6 +119,30 @@ class FTPSPeer(Listener):
                             data_socket.unwrap().close()
                         passive.close(); passive=None
                         reply("226 Transfer complete")
+                    elif verb=="STOR":
+                        # The printer's own STOR: a TLS data channel the client ends without
+                        # close_notify (bpm shuts the socket down), then 226.
+                        reply("150 Ok to send data")
+                        conn,_=passive.accept()
+                        chunks=[]
+                        with self.ctx.wrap_socket(conn,server_side=True) as data_socket:
+                            try:
+                                while chunk:=data_socket.recv(65536):
+                                    chunks.append(chunk)
+                            except (ssl.SSLEOFError, ConnectionResetError):
+                                pass  # end of data without TLS close_notify
+                        passive.close(); passive=None
+                        self.files[arg.lstrip("/")]=b"".join(chunks); self.stores.append(arg.lstrip("/"))
+                        reply("226 Transfer complete")
+                    elif verb=="DELE":
+                        if self.files.pop(arg.lstrip("/"),None) is None: reply("550 File not found")
+                        else: reply("250 Delete operation successful")
+                    elif verb=="RNFR":
+                        rename_from=arg.lstrip("/") if arg.lstrip("/") in self.files else None
+                        reply("350 Ready for RNTO" if rename_from else "550 File not found")
+                    elif verb=="RNTO" and rename_from:
+                        self.files[arg.lstrip("/")]=self.files.pop(rename_from); rename_from=None
+                        reply("250 Rename successful")
                     elif verb=="SIZE":
                         data=self.files.get(arg.lstrip("/"))
                         reply("550 File not found" if data is None else f"213 {len(data)}")
