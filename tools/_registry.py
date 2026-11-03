@@ -131,6 +131,7 @@ ANNOTATIONS: dict[str, tuple[str, bool, bool, bool, bool]] = {
     "pause_mqtt_session": ("Bambu: Pause MQTT Session", False, False, True, True),
     "pause_print": ("Bambu: Pause Print", False, False, True, True),
     "prepare_print_job": ("Bambu: Prepare Verified Print Job", False, False, False, False),
+    "register_sd_card": ("Bambu: Register SD Card Size From Operator Record", False, False, False, True),
     "preview_ams_mapping": ("Bambu: Preview AMS Mapping", True, False, True, True),
     "print_file": ("Bambu: Start Print From SD Card", False, True, False, True),
     "refresh_nozzles": ("Bambu: Refresh Nozzle Info", False, False, True, True),

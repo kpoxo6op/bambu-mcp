@@ -62,7 +62,7 @@ import inspect
 # telemetry is not live. Their own user_permission and active-print checks still run first.
 PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
     "calibrate_ams_remaining", "clear_print_error", "create_folder", "delete_file", "load_filament",
-    "pause_print", "print_file", "refresh_nozzles", "rename_printer", "rename_sdcard_file",
+    "pause_print", "print_file", "refresh_nozzles", "register_sd_card", "rename_printer", "rename_sdcard_file",
     "resume_print", "select_extrusion_calibration", "send_ams_control_command", "send_gcode",
     "send_mqtt_command", "set_air_printing_detection", "set_ams_filament_setting",
     "set_ams_user_setting", "set_bed_temp", "set_buildplate_marker_detection", "set_chamber_light",

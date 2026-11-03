@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import select
 import socket
 import ssl
@@ -1053,6 +1054,110 @@ async def campaign(seed, cycles):
                     assert len(ftps.stores) == stores and ftps.files[CARD_RECORD] == card_record(), ftps.stores[stores:]
                     assert sum(1 for verb, _ in ftps.commands if verb == "RNFR") == renames
                     events.append({"contract":"the card record cannot be uploaded or renamed onto by a caller", "sent":0})
+                    # A card that stays in the printer (2026-11-04): formatted and checked on a computer (clean
+                    # fsck.fat -n -v), put back without a record. ops/register_sd_card.py, a separate process,
+                    # takes the saved fsck output and has the server write the record over its own FTPS
+                    # session. Real FAT32 images with 32 KiB clusters, as on the P1S card, give the logs.
+                    def fat_image(path, mib):
+                        subprocess.run(["/usr/sbin/mkfs.fat", "-F", "32", "-s", "64", "-S", "512", "-n", "BAMBU_P1S",
+                                        "-C", str(path), str(mib * 1024)], check=True, capture_output=True)
+                    def fsck_log(image, name, *flags):
+                        run = subprocess.run(["/usr/sbin/fsck.fat", "-n", *flags, str(image)], capture_output=True, text=True)
+                        (tmp / name).write_text(run.stdout + run.stderr)
+                        return str(tmp / name)
+                    card_img, other_img = tmp / "card.img", tmp / "other.img"
+                    fat_image(card_img, 4096)
+                    fat_image(other_img, 3072)
+                    verbose, final = fsck_log(card_img, "fsck-v.log", "-v"), fsck_log(card_img, "fsck.log")
+                    mismatched = fsck_log(other_img, "fsck-other.log")
+                    with open(card_img, "r+b") as fh:  # a wrong free-cluster summary, as the dashcam card had
+                        fh.seek(512 + 488)
+                        fh.write(struct.pack("<I", 12345))
+                    dirty = fsck_log(card_img, "fsck-dirty.log", "-v")
+                    assert "Free cluster summary wrong" in Path(dirty).read_text(), Path(dirty).read_text()
+                    data_bytes = int(re.search(r"data clusters \((\d+) bytes\)", Path(verbose).read_text())[1])
+                    registry = tmp / "home" / ".bambu-mcp" / "sd-card"
+                    custody = "E2E: formatted and checked on a computer, put back into the fixture printer"
+                    async def register(*logs):
+                        cmd = [sys.executable, str(ROOT / "ops/register_sd_card.py"), "--printer", "fixture",
+                               "--mcp", url, "--custody", custody, "--evidence", str(tmp / "notes.txt")]
+                        for log_path in logs:
+                            cmd += ["--fsck-log", log_path]
+                        run = await asyncio.to_thread(subprocess.run, cmd, env=env, cwd=ROOT, capture_output=True,
+                                                      text=True, timeout=60)
+                        try:
+                            return run.returncode, json.loads(run.stdout)
+                        except ValueError:
+                            raise AssertionError((run.returncode, run.stdout, run.stderr)) from None
+                    record, dashcam = ftps.files.pop(CARD_RECORD), ftps.sizes["MOVE-dashcam.mp4"]
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    # Logs without the geometry, of two filesystems, or of an unclean one: the CLI refuses
+                    # and writes nothing.
+                    for logs, why in (((final,), "no log shows the geometry"),
+                                      ((verbose, mismatched), "not of one filesystem"),
+                                      ((dirty,), "Free cluster summary wrong")):
+                        code, out = await register(*logs)
+                        assert code == 1 and out.get("registered") is False and why in out["error"], (why, out)
+                    assert not registry.exists(), list(registry.iterdir())
+                    # An MCP caller cannot write a registration (download_file refuses the store) or apply
+                    # one that the operator did not make; the tool takes no size.
+                    forged_id = "3" * 32
+                    refused = await call("download_file", remote_path="/notes.txt", user_permission=True,
+                                         local_path=str(registry / f"{forged_id}.json"))
+                    assert refused.get("error") == "local_path_reserved", refused
+                    refused = await call("register_sd_card", registration_id=forged_id, user_permission=True)
+                    assert refused.get("error") == "registration_missing", refused
+                    # A card listing more than the logs' data area is not that card; an incomplete listing
+                    # is unknown. Each registration is used up by its one call.
+                    ftps.sizes["MOVE-dashcam.mp4"] = 5 << 30
+                    code, out = await register(verbose, final)
+                    assert code == 1 and out.get("error") == "registration_inconsistent", out
+                    ftps.sizes["MOVE-dashcam.mp4"] = dashcam
+                    ftps.root_rows = ["lrwxrwxrwx 1 test test 9 Jan 01 2026 video -> /x"]
+                    code, out = await register(verbose, final)
+                    assert code == 1 and out.get("error") == "storage_unknown" and "incomplete" in out["detail"], out
+                    ftps.root_rows = []
+                    assert len(ftps.stores) == stores and CARD_RECORD not in ftps.files, ftps.stores[stores:]
+                    assert not list(registry.glob("????????????????????????????????.json")), list(registry.iterdir())
+                    code, out = await register(verbose, final)
+                    assert code == 0 and out.get("registered") is True, out
+                    reg_id, written = out["registration_id"], json.loads(ftps.files[CARD_RECORD])
+                    assert ftps.stores[stores:] == [CARD_RECORD], ftps.stores[stores:]
+                    assert (written["card_id"], written["data_bytes"], written["cluster_bytes"]) == (reg_id, data_bytes, 32768)
+                    assert "not checked since" in written["basis"] and custody in written["basis"], written
+                    assert out["storage"]["card_id"] == reg_id and out["storage"]["available_bytes"] == \
+                        data_bytes - out["storage"]["listed_allocated_bytes"], out
+                    assert json.loads(Path(out["receipt"]).read_text())["answer"]["registered"] is True
+                    # Used once; a card that has a record keeps it.
+                    refused = await call("register_sd_card", registration_id=reg_id, user_permission=True)
+                    assert refused.get("error") == "registration_missing", refused
+                    code, out = await register(verbose, final)
+                    assert code == 1 and out.get("error") == "storage_already_attested", out
+                    assert ftps.stores[stores:] == [CARD_RECORD] and json.loads(ftps.files[CARD_RECORD]) == written
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"a card checked on a computer is registered in the printer from its fsck "
+                                   "logs by the operator CLI; unclean, inconsistent and mismatched logs, an incomplete "
+                                   "listing, a caller's registration and replays write nothing", "stores":1})
+                    # The registered card admits like an attested one: the upload binds it, the start measures
+                    # the unpacked G-code and reserve again, and one start reaches the wire.
+                    up = await upload(prep["job_path"], "/registered.gcode.3mf")
+                    assert up.get("admission") and up["storage"]["card_id"] == reg_id, up
+                    assert up["storage"]["data_bytes"] == data_bytes and "operator registration" in up["storage"]["basis"], up
+                    ftps.sizes["MOVE-dashcam.mp4"] = data_bytes - 40 * MiB  # another writer filled it
+                    refused = await start("/registered.gcode.3mf")
+                    assert refused.get("error") == "storage_insufficient" and "admission is kept" in refused["detail"], refused
+                    ftps.sizes["MOVE-dashcam.mp4"] = dashcam
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    printed = await start("/registered.gcode.3mf")
+                    assert "error" not in printed and printed["storage"]["card_id"] == reg_id, printed
+                    await asyncio.sleep(.1)
+                    commands = broker.mutations()[before:]
+                    assert len(commands) == 1 and commands[0]["print"]["command"] == "project_file", commands
+                    assert commands[0]["print"]["md5"] == hashlib.md5(job).hexdigest().upper(), commands
+                    assert (await start("/registered.gcode.3mf")).get("error") == "print_not_admitted"
+                    ftps.files[CARD_RECORD] = record
+                    events.append({"contract":"a registered card admits an upload and one start, measured again "
+                                   "before the start", "sent":1})
                     # The admitted path: plate and options are checked before the admission is used, the
                     # card is re-read before the start, and exactly one bound start reaches the wire.
                     before, stores = len(broker.mutations()), len(ftps.stores)
@@ -1233,6 +1338,8 @@ async def campaign(seed, cycles):
                                                         "remote_path":"/during-print.txt"})]:
                         refused = await call(tool, **args)
                         assert "SD card access is refused" in str(refused), (tool, refused)
+                    code, out = await register(verbose, final)  # no card write while a job runs
+                    assert code == 1 and "SD card access is refused" in out.get("detail", ""), out
                     before = len(broker.mutations())
                     for tool, args in [
                         ("load_filament", {"unit_id":0,"slot_id":254}),

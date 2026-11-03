@@ -2,7 +2,7 @@
 
 # Files
 
-20 tools, defined in [`tools/files.py`](https://github.com/synman/bambu-mcp/blob/main/tools/files.py).
+21 tools, defined in [`tools/files.py`](https://github.com/synman/bambu-mcp/blob/main/tools/files.py).
 
 | Tool | Title | Access |
 |---|---|---|
@@ -24,6 +24,7 @@
 | [`preview_ams_mapping`](#preview_ams_mapping) | Preview AMS Mapping | read-only |
 | [`print_file`](#print_file) | Start Print From SD Card | write, destructive |
 | [`refresh_sdcard`](#refresh_sdcard) | Refresh SD Card Listing | read-only |
+| [`register_sd_card`](#register_sd_card) | Register SD Card Size From Operator Record | write |
 | [`rename_sdcard_file`](#rename_sdcard_file) | Rename SD Card File | write |
 | [`upload_file`](#upload_file) | Upload File To SD Card | write, destructive |
 
@@ -122,7 +123,7 @@ transfer any file.
 
 - `name` (string, required): Configured printer name (see ``get_configured_printers``).
 - `remote_path` (string, required): Full path of the file on the printer's SD card.
-- `local_path` (string, required): Destination path on this host. Paths inside the server's prepared-job store (``~/.bambu-mcp/preflight/``) are refused, so a download can never replace a prepared job or its report.
+- `local_path` (string, required): Destination path on this host. Paths inside the server's prepared-job store (``~/.bambu-mcp/preflight/``) and SD card registration store (``~/.bambu-mcp/sd-card/``) are refused, so a download can never replace a prepared job, its report or an operator's card registration.
 - `user_permission` (boolean, default `false`): Must be True to execute. Default False.
 
 **Returns**
@@ -131,7 +132,7 @@ transfer any file.
 success. Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
 ``user_permission`` is False, ``"Printer '<name>' not connected"``, or
 ``"Error downloading file: <exception>"``; or ``{"error": "local_path_reserved",
-"detail": str}`` for a destination inside the prepared-job store.
+"detail": str}`` for a destination inside either store.
 
 ## get_3mf_entry_by_id
 
@@ -925,6 +926,46 @@ failed (a timeout, a dropped connection, a folder that could not be listed) is t
 refuses to list is treated as empty. If the call raises instead (for example the FTPS
 connection cannot be opened), the error names the exception and the previous cached
 trees are left in place.
+
+## register_sd_card
+
+**Register SD Card Size From Operator Record** · write · needs `user_permission=True`
+
+Record the size of the SD card in the printer on the card, from an operator registration.
+
+**WHEN to use:** only as the last step of ``ops/register_sd_card.py``, which an operator runs on
+this host with saved ``fsck.fat -n`` output of this card (checked on a computer) and a
+custody statement, and which calls this tool itself with the id it prints. This tool takes
+no size: the size comes from the fsck output in the registration, parsed again here. A card
+in a computer is recorded with ``ops/attest_sd_card.py`` instead (docs/storage-space.md).
+
+**WRITE GUARD:** writes ``/bambu-mcp-card.json`` (about 1 KB) to the printer's SD card
+over this server's own FTPS session, only while the printer reports no job, only when the
+card has no record yet. With ``user_permission`` False nothing is read or written.
+
+**Sibling disambiguation:** ``upload_file`` and ``rename_sdcard_file`` refuse the record's name
+(``storage_record_protected``); this is the only tool that writes it.
+
+**Parameters**
+
+- `name` (string, required): Configured printer name (see ``get_configured_printers``).
+- `registration_id` (string, required): The 32-hex id ``ops/register_sd_card.py`` printed. Each registration is used once, by the first call naming it, and expires 15 minutes after it was made.
+- `user_permission` (boolean, default `false`): Must be True to execute. Default False.
+
+**Returns**
+
+``{"registered": True, "registration_id", "device", "fsck_used_clusters", "sd_card",
+"storage": {"card_id", "attested_at", "basis", "data_bytes", "cluster_bytes",
+"listed_allocated_bytes", "files", "folders", "available_bytes", "listing_s"}}``: the card
+as uploads and starts will now read it. Errors are ``{"error": code, "detail": str}`` with
+nothing written for ``registration_invalid``, ``registration_missing`` (none pending with
+that id: never made, already used), ``registration_store_untrusted``,
+``storage_already_attested``, ``registration_inconsistent`` (the card lists more than the
+registered data area), ``storage_state_unknown``, ``storage_no_card``,
+``storage_card_abnormal``, ``storage_card_read_only``, ``storage_unknown`` (card unreadable,
+listing incomplete, or the printer reports a job) and ``file_operation_busy``;
+``registration_failed`` when the write, its read-back or the measurement after it failed (detail says what the card
+may hold); the ``_permission_denied`` refusal; ``"Printer '<name>' not connected"``.
 
 ## rename_sdcard_file
 

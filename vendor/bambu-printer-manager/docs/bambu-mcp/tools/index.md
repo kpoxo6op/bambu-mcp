@@ -2,9 +2,9 @@
 
 # MCP Tools
 
-bambu-mcp registers 106 tools. Each carries MCP annotations: a title and a read-only flag, plus destructive, idempotent and open-world hints.
+bambu-mcp registers 107 tools. Each carries MCP annotations: a title and a read-only flag, plus destructive, idempotent and open-world hints.
 
-50 of the 54 write tools refuse to act unless called with `user_permission=True`. Without it they change nothing and return a refusal naming the consequence. The rest need no permission because they change only the local server, not the printer: `prepare_print_job`, `set_user_pref`, `start_stream`, `stop_stream`. Tools that disturb a print also refuse while the printer is printing, whatever `user_permission` says.
+51 of the 55 write tools refuse to act unless called with `user_permission=True`. Without it they change nothing and return a refusal naming the consequence. The rest need no permission because they change only the local server, not the printer: `prepare_print_job`, `set_user_pref`, `start_stream`, `stop_stream`. Tools that disturb a print also refuse while the printer is printing, whatever `user_permission` says.
 
 Parameters, return shapes and notes below come from the tool docstrings the server sends to MCP clients.
 
@@ -19,7 +19,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 | [Nozzles](nozzle.md) | 4 | 3 |
 | [Detectors](detectors.md) | 7 | 6 |
 | [Printer Management](management.md) | 7 | 5 |
-| [Files](files.md) | 20 | 7 |
+| [Files](files.md) | 21 | 8 |
 | [System](system.md) | 13 | 8 |
 | [Discovery](discovery.md) | 1 | 0 |
 | [Raw Commands](commands.md) | 1 | 1 |
@@ -95,6 +95,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 | [`print_file`](files.md#print_file) | Start Print From SD Card | Files | write, destructive |
 | [`refresh_nozzles`](nozzle.md#refresh_nozzles) | Refresh Nozzle Info | Nozzles | write |
 | [`refresh_sdcard`](files.md#refresh_sdcard) | Refresh SD Card Listing | Files | read-only |
+| [`register_sd_card`](files.md#register_sd_card) | Register SD Card Size From Operator Record | Files | write |
 | [`remove_printer`](management.md#remove_printer) | Remove Printer | Printer Management | write, destructive |
 | [`rename_printer`](system.md#rename_printer) | Rename Printer Device | System | write |
 | [`rename_sdcard_file`](files.md#rename_sdcard_file) | Rename SD Card File | Files | write |

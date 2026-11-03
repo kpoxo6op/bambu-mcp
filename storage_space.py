@@ -17,10 +17,17 @@ What the printer offers (docs/storage-space.md has the sources):
   FTPS   names and sizes (LIST). No free-space or capacity command is documented for the
          printer's FTPS dialect, so none is sent.
 
-So the card's capacity comes from the card itself: ops/attest_sd_card.py, run on a computer with
-the card inserted, requires a clean `fsck.fat -n`, reads the data-area size and cluster size from
-the filesystem and writes /bambu-mcp-card.json with a random card id. The server reads that file
-and lists the whole card (both over FTPS, only while the printer reports no job). The listing
+So the card's capacity comes from the card itself: /bambu-mcp-card.json, a record of the data-area
+size and cluster size taken from a clean `fsck.fat -n` of that card, with a random card id. Two
+operator paths write it, never a caller's upload or rename (protect_record):
+  ops/attest_sd_card.py      the card in a computer: fsck, write the record, fsck again.
+  ops/register_sd_card.py    the card stays in the printer: the operator hands over fsck logs of
+                             this card already taken on a computer and a custody statement; the CLI
+                             writes a one-shot registration into a host store no MCP file tool
+                             writes (registry_root), and register_sd_card has this server re-parse
+                             the logs and write the record over its own FTPS session.
+The server reads the record and lists the whole card (both over FTPS, only while the printer
+reports no job). The listing
 must be complete: a folder the printer refuses to list (550) or a listing row that is not a
 recognised file or folder refuses, because what it hides can be any size. Then:
 
@@ -46,6 +53,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -59,8 +67,8 @@ MAX_MARKER_BYTES = 4096
 RESERVE_BYTES = 64 * 1024 * 1024
 SD_STATES = {0: "absent", 1: "normal", 2: "abnormal", 3: "read_only"}
 
-_ATTEST = ("Run ops/attest_sd_card.py with the card in a computer (see docs/storage-space.md); "
-           "it checks the filesystem and records the card's size on it.")
+_ATTEST = ("Record the card's size with ops/attest_sd_card.py (card in a computer) or "
+           "ops/register_sd_card.py (card in the printer, from fsck logs of this card); see docs/storage-space.md.")
 
 _lock = threading.Lock()
 _last: dict[str, dict] = {}
@@ -121,8 +129,8 @@ _RECORD_NAMES = re.compile(r"/(bambu-mcp-card\.json|bambu\S*~\d+\.jso)", re.I)
 
 
 def protect_record(remote: str) -> None:
-    """Refuse a server write onto the card record: the record is the card's capacity, so only
-    ops/attest_sd_card.py writes it, on a computer, after fsck. A caller's upload would be a claim."""
+    """Refuse a caller's write onto the card record: the record is the card's capacity, so only the
+    operator paths write it (attest on a computer; register from fsck logs). An upload would be a claim."""
     if _RECORD_NAMES.fullmatch(remote.rstrip(" ./")):
         raise pa.Refused("storage_record_protected",
                          f"{remote} is the SD card's record, which states the card's size; this server does not "
@@ -257,7 +265,8 @@ def measure(printer) -> dict:
                          "free space is unknown. Nothing was written and no command was sent.") from None
     cluster = card["cluster_bytes"]
     used, files, folders = _usage(tree, cluster)
-    return {"card_id": card["card_id"], "attested_at": card.get("attested_at"), "data_bytes": card["data_bytes"],
+    return {"card_id": card["card_id"], "attested_at": card.get("attested_at"), "basis": card.get("basis"),
+            "data_bytes": card["data_bytes"],
             "cluster_bytes": cluster, "listed_allocated_bytes": used, "files": files, "folders": folders,
             "available_bytes": card["data_bytes"] - used, "listing_s": listing_s}
 
@@ -310,3 +319,207 @@ def require_for_start(name: str, printer, admitted, plate: int) -> dict:
     gcode = dict(admitted.plate_gcode_bytes)[plate]
     return require(name, printer, "start", lambda cluster: {"unpacked_gcode": _clusters(gcode, cluster)},
                    card_id=admitted.card_id)
+
+
+# ── Operator registration: a card that stays in the printer ────────────────────────────────────
+#
+# 2026-11-04: the P1S's card was formatted and checked on a computer (clean fsck.fat -n -v) and
+# went back into the printer without a record; it stays there. ops/register_sd_card.py takes the
+# saved fsck output of that check and an operator's custody statement, writes a one-shot
+# registration into registry_root() (download_file refuses destinations there, so no MCP caller
+# writes one), and calls register_sd_card. This server parses the logs again, lists the card and
+# writes the record over its own FTPS session. No size is taken from anyone: it is the fsck output.
+
+REGISTRATION_SCHEMA = "bambu-mcp-card-registration/1"
+REGISTRATION_MAX_AGE_S = 900
+MAX_REGISTRATION_BYTES = 256 * 1024
+MAX_FSCK_LOG_BYTES = 64 * 1024
+MAX_CUSTODY_CHARS = 1000
+# fsck.fat output meaning the filesystem is not clean: the words ops/attest_sd_card.py refuses.
+FSCK_PROBLEMS = re.compile(r"wrong|differ|truncat|reclaim|correct|bad |invalid|lost|free cluster summary|"
+                           r"unable|error|has no|cluster chain|duplicate|dirty", re.I)
+_FSCK_SUMMARY = re.compile(r"(?P<device>/\S+): (?P<files>\d+) files, (?P<used>\d+)/(?P<clusters>\d+) clusters")
+_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def registry_root() -> Path:
+    """Host store for operator card registrations (ops/register_sd_card.py writes, this server reads)."""
+    return Path.home() / ".bambu-mcp" / "sd-card"
+
+
+def registry_dir(create: bool = False) -> Path:
+    """registry_root(), required to be a directory only the service user can use."""
+    root = registry_root()
+    if create:
+        root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        st = os.lstat(root)
+    except FileNotFoundError:
+        raise pa.Refused("registration_missing", f"There is no registration store ({root}); run "
+                         "ops/register_sd_card.py. Nothing was written.") from None
+    if (stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+            or st.st_mode & 0o077):
+        raise pa.Refused("registration_store_untrusted",
+                         f"{root} must be a directory owned by the service user with mode 0700. Nothing was written.")
+    return root
+
+
+def parse_fsck_log(text: str) -> dict:
+    """One saved `fsck.fat -n [-v]` output of a clean FAT filesystem: its summary line and, from -v,
+    the data area and cluster size. ValueError for anything else: a problem line, a check that did
+    not reach its summary, or geometry that does not add up."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("fsck.fat "):
+        raise ValueError("not fsck.fat output (its first line names fsck.fat)")
+    problems = [line.strip() for line in lines
+                if not line.startswith(("fsck.fat", "Checking", "Boot sector")) and FSCK_PROBLEMS.search(line)]
+    if problems:
+        raise ValueError(f"fsck reported problems: {problems[:3]}")
+    summary = _FSCK_SUMMARY.fullmatch(lines[-1].strip())
+    if not summary:
+        raise ValueError("its last line is not fsck's '<device>: N files, used/total clusters' summary")
+    out = {"device": summary["device"], "files": int(summary["files"]),
+           "used_clusters": int(summary["used"]), "clusters": int(summary["clusters"])}
+    cluster = re.search(r"^\s*(\d+) bytes per cluster\s*$", text, re.M)
+    data = re.search(r"^\s*(\d+) data clusters \((\d+) bytes\)\s*$", text, re.M)
+    if cluster or data:
+        if not (cluster and data):
+            raise ValueError("it shows only part of the filesystem geometry")
+        size, count, data_bytes = int(cluster[1]), int(data[1]), int(data[2])
+        if count * size != data_bytes or count != out["clusters"]:
+            raise ValueError("its geometry does not add up")
+        out.update(cluster_bytes=size, data_bytes=data_bytes)
+    if not 0 < out["used_clusters"] <= out["clusters"]:
+        raise ValueError("its cluster counts are impossible")
+    return out
+
+
+def card_geometry(logs: list[str]) -> dict:
+    """The data area and cluster size of one filesystem from its saved clean fsck logs, oldest
+    first. At least one must be verbose (-v); all must name the same device and cluster count."""
+    parsed = [parse_fsck_log(text) for text in logs]
+    geo = next((p for p in parsed if "data_bytes" in p), None)
+    if geo is None:
+        raise ValueError("no log shows the geometry; include the `fsck.fat -n -v` output")
+    for p in parsed:
+        if (p["device"], p["clusters"], p.get("cluster_bytes", geo["cluster_bytes"])) != \
+                (geo["device"], geo["clusters"], geo["cluster_bytes"]):
+            raise ValueError("the logs are not of one filesystem (device, cluster count or cluster size differ)")
+    size = geo["cluster_bytes"]
+    if not (512 <= size <= 1 << 21 and size & (size - 1) == 0 and 0 < geo["data_bytes"] <= 1 << 42):
+        raise ValueError("the geometry is outside what a card record accepts")
+    return {"device": geo["device"], "cluster_bytes": size, "data_bytes": geo["data_bytes"],
+            "clusters": geo["clusters"], "used_clusters": parsed[-1]["used_clusters"], "logs": len(parsed)}
+
+
+def _take_registration(name: str, registration_id) -> tuple[dict, dict]:
+    """Claim the pending registration (renamed before it is read, so it is used once whatever
+    follows) and validate it: (registration, geometry parsed again from its fsck logs)."""
+    if not isinstance(registration_id, str) or not _ID.fullmatch(registration_id):
+        raise pa.Refused("registration_invalid", "registration_id must be the 32-hex id ops/register_sd_card.py "
+                         "printed. Nothing was written.")
+    root = registry_dir()
+    taken = root / f"{registration_id}.used.json"
+    try:
+        os.rename(root / f"{registration_id}.json", taken)
+    except FileNotFoundError:
+        raise pa.Refused("registration_missing", f"No pending registration {registration_id}: each is used once, "
+                         "by this call. Run ops/register_sd_card.py for a new one. Nothing was written.") from None
+    try:
+        reg = json.loads(pa._read_regular(taken, MAX_REGISTRATION_BYTES))
+        if not isinstance(reg, dict) or reg.get("schema") != REGISTRATION_SCHEMA \
+                or reg.get("registration_id") != registration_id:
+            raise ValueError(f"not a {REGISTRATION_SCHEMA} record with this id")
+        if reg.get("printer") != name:
+            raise ValueError(f"it is for printer {reg.get('printer')!r}, not {name!r}")
+        age = time.time() - float(reg.get("created_at"))
+        if not -60 <= age <= REGISTRATION_MAX_AGE_S:
+            raise ValueError(f"it was made {age:.0f} s ago; it must be used within {REGISTRATION_MAX_AGE_S} s")
+        custody, measured = reg.get("custody"), reg.get("measured_at")
+        if not isinstance(custody, str) or not 10 <= len(custody.strip()) <= MAX_CUSTODY_CHARS:
+            raise ValueError(f"its custody statement must be 10 to {MAX_CUSTODY_CHARS} characters")
+        if not isinstance(measured, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", measured):
+            raise ValueError("measured_at is not a UTC time")
+        logs = reg.get("fsck_logs")
+        if not isinstance(logs, list) or not logs or not all(isinstance(entry, dict) for entry in logs):
+            raise ValueError("it has no fsck logs")
+        texts = [entry.get("text") for entry in logs]
+        if not all(isinstance(t, str) and len(t) <= MAX_FSCK_LOG_BYTES for t in texts):
+            raise ValueError("an fsck log is missing or too long")
+        geo = card_geometry(texts)
+    except (OSError, ValueError, TypeError) as exc:
+        raise pa.Refused("registration_invalid", f"Registration {registration_id} is not usable ({exc}); it is now "
+                         "used up. Nothing was written.") from None
+    return reg, geo
+
+
+def register(name: str, printer, registration_id) -> dict:
+    """Write the card record to the card in the printer from an operator registration, over one
+    FTPS session of the printer session (refused while it reports a job), then read it back
+    through measure(). Refuses a card that already has a record, a listing that is incomplete
+    and a card that lists more than the registered data area."""
+    with pa.file_lock(name):
+        reg, geo = _take_registration(name, registration_id)
+        try:
+            sd = check_sd_state(printer)
+        except pa.Refused as r:
+            _record(name, {"purpose": "register", "verdict": r.code, "sd_card": sd_state(printer)})
+            raise
+        record = {"schema": MARKER_SCHEMA, "card_id": registration_id, "data_bytes": geo["data_bytes"],
+                  "cluster_bytes": geo["cluster_bytes"], "attested_at": reg["measured_at"],
+                  "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "basis": f"operator registration from {geo['logs']} clean fsck.fat -n log(s) taken on a computer, "
+                           f"newest {reg['measured_at']}; not checked since the card went into the printer. "
+                           f"Custody: {reg['custody'].strip()}"}
+        data = json.dumps(record, separators=(",", ":")).encode()
+        if len(data) > MAX_MARKER_BYTES:
+            raise pa.Refused("registration_invalid", "The card record would be too long. Nothing was written.")
+        tmpdir = tempfile.mkdtemp(prefix=".card-", dir=pa._ensure_root())
+        stored = False
+        try:
+            local, back = os.path.join(tmpdir, "card.json"), os.path.join(tmpdir, "back.json")
+            Path(local).write_bytes(data)
+            with printer.ftp_connection() as ftps:
+                tree = _list_card(ftps)
+                if any("children" not in c and c["name"].casefold() == MARKER[1:] for c in tree["children"]):
+                    raise pa.Refused("storage_already_attested", f"The card already has {MARKER}; it is not "
+                                     "replaced. Nothing was written.")
+                used, files, folders = _usage(tree, geo["cluster_bytes"])
+                if used > geo["data_bytes"]:
+                    raise pa.Refused("registration_inconsistent",
+                                     f"The card in the printer lists {_mib(used)} in {files} files and {folders} folders, "
+                                     f"more than the {_mib(geo['data_bytes'])} data area the fsck logs show: it is not "
+                                     "the card they describe. Nothing was written.")
+                stored = True
+                ftps.upload_file(local, MARKER)
+                ftps.download_file(MARKER, back)
+                if Path(back).read_bytes() != data:
+                    ftps.delete_file(MARKER)
+                    stored = False
+                    raise pa.Refused("registration_failed", f"{MARKER} read back from the card differs from what "
+                                     "was written; it was deleted again. The card is not registered.")
+        except pa.Refused:
+            raise
+        except Exception as exc:
+            raise pa.Refused("registration_failed" if stored else "storage_unknown",
+                             f"The card could not be {'written' if stored else 'read'} ({type(exc).__name__}: {exc}). "
+                             + (f"It may hold a partial {MARKER}, which is refused unless it validates; "
+                                "list the card before trying again." if stored else "Nothing was written.")) from None
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            evidence = measure(printer)  # the record as every upload and start will read it
+        except pa.Refused as r:
+            raise pa.Refused("registration_failed", f"{MARKER} was written and read back, but measuring the card "
+                             f"then failed ({r.code}: {r.detail}). The card holds the record; an upload measures it "
+                             "again.", storage_error=r.code) from None
+        if evidence["card_id"] != registration_id:
+            raise pa.Refused("registration_failed", f"After writing, the card's record reads as {evidence['card_id']}, "
+                             f"not {registration_id}. The card is not registered.")
+        _record(name, {"purpose": "register", "verdict": "registered", **evidence, "sd_card": sd})
+        return {"registered": True, "registration_id": registration_id, "device": geo["device"],
+                "fsck_used_clusters": geo["used_clusters"], "sd_card": sd, "storage": evidence}

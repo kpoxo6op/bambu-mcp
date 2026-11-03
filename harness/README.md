@@ -118,6 +118,14 @@ Replay a failure:
   row each refuse the upload and the start (`storage_unknown`) with no STOR or `project_file`. A
   caller cannot write the card record: uploads to its name (any case, a trailing dot, the 8.3
   alias) and a rename onto it are refused with nothing sent.
+  A card that stays in the printer (2026-11-04) is registered by `ops/register_sd_card.py`, run as its
+  own process against the server over HTTP MCP with fsck logs of real FAT32 images made by
+  `mkfs.fat`: logs without the geometry, of two filesystems or with a wrong free-cluster summary are
+  refused by the CLI; a caller cannot download into the registration store or apply an id the
+  operator did not make; a card listing more than the logs' data area, an incomplete listing, a
+  replayed id, a card that already has a record and a job in progress write nothing. The registered
+  record is written once over the server's FTPS session; an upload binds it, a start is refused when
+  the card fills, then one start reaches the wire.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.
