@@ -30,6 +30,15 @@ def _config_init_scaled(self, *args, **kwargs):
     _config_init(self, *args, **kwargs)
     self.watchdog_timeout = reliability.PUSHALL_EVERY_S
 bambuconfig.BambuConfig.__init__ = _config_init_scaled
+# paho reports any socket failure to its callbacks as a generic "Unspecified error"; its own error
+# log names the actual exception. Diagnostics only: nothing in the server reads it.
+import logging
+import paho.mqtt.client as paho_client
+_paho_init = paho_client.Client.__init__
+def _paho_init_logged(self, *args, **kwargs):
+    _paho_init(self, *args, **kwargs)
+    self.enable_logger(logging.getLogger("paho"))
+paho_client.Client.__init__ = _paho_init_logged
 import server
 
 sys.argv = ["server.py", "--transport", "streamable-http"]

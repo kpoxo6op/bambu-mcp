@@ -56,6 +56,13 @@ Replay a failure:
   ha-bambulab send imply; that firmware behaviour is not shown on the live printer. Over 6 s
   every health sample must be live with advancing layers on one connection, a full-state
   keep-alive must still go out while reports stream, and writes are refused once they stop.
+* While an 8 MB write is held in the full TCP send buffer, four callers refresh for 1.5 s, each
+  publishing from its own thread. paho as bpm runs it wrote from the calling thread, and OpenSSL
+  refused the pending write's retry ("bad length"): the link dropped before the start could meet
+  real backpressure (CI 2026-11-03). The link must stay up; the start then has unknown delivery.
+* The simulated broker reads and writes each TLS connection from that connection's own thread
+  only; other threads queue packets. One SSL object used from several threads corrupts records,
+  and closing a socket another thread is reading lets a new connection reuse its fd.
 * Client-side MQTT sockets are counted from `/proc/net/tcp` in the namespace at
   every accepted connection and after every fault. More than one ESTABLISHED or
   CLOSE_WAIT socket fails the run; CLOSE_WAIT is the 2026-11-01 leak.

@@ -6,12 +6,14 @@ Seeds are recorded and replayable. No production credentials or printer address.
 """
 import asyncio
 import base64
+import collections
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
+import select
 import socket
 import ssl
 import struct
@@ -112,6 +114,13 @@ class Broker:
         # the layer. This is the vendor clients' renewal, not behaviour shown on the live firmware.
         self.lease_s = None
         self.lease_until = 0.
+        # Why each peer connection ended and any write that failed on it, printed on failure: the
+        # MCP side only sees paho's generic "Unspecified error".
+        self.wire_events = []
+        # Each peer's TLS socket is read and written only by its own serve thread (one SSL object
+        # used from two threads corrupts records). Others queue packets here: peer -> (deque, wake).
+        self.outbox = {}
+        self.kill = set()
         self.layer = 2
         self.held_max = 0
         self.stop = threading.Event()
@@ -139,9 +148,28 @@ class Broker:
                 return
             threading.Thread(target=self.serve, args=(raw,), daemon=True).start()
 
+    def note(self, peer, what):
+        self.wire_events.append(f"{time.strftime('%H:%M:%S')}.{int(time.time()*1000)%1000:03d} "
+                                f"peer {id(peer) % 10000:04d} {what}")
+
     def send(self, peer, data):
-        with self.lock:
-            peer.sendall(data)
+        """Queue a packet for the peer's serve thread, the only writer of its TLS socket."""
+        box = self.outbox.get(peer)
+        if box is None:
+            raise ConnectionError("peer connection has ended")
+        box[0].append(data)
+        try:
+            box[1].send(b"\0")
+        except OSError:
+            pass
+
+    def wake(self, peer):
+        box = self.outbox.get(peer)
+        if box is not None:
+            try:
+                box[1].send(b"\0")
+            except OSError:
+                pass
 
     def report(self, peer, data=None):
         if data is None:
@@ -173,6 +201,63 @@ class Broker:
             self.blackholed |= dead
             self.peers -= dead
 
+    @staticmethod
+    def take_packet(buf):
+        """One complete MQTT packet (type, body) removed from the front of buf, or None."""
+        length, scale, i = 0, 1, 1
+        while True:
+            if i >= len(buf):
+                return None
+            b = buf[i]
+            length += (b & 127) * scale
+            i += 1
+            if not b & 128:
+                break
+            scale *= 128
+            if i > 4:
+                raise ValueError("malformed remaining length")
+        if len(buf) < i + length:
+            return None
+        typ, body = buf[0] >> 4, bytes(buf[i:i+length])
+        del buf[:i+length]
+        return typ, body
+
+    def handle(self, peer, typ, body):
+        """React to one packet from the client; True when the connection must end after the replies."""
+        if typ == 1 and self.mode == "unauthorized":
+            self.refusals += 1
+            self.send(peer, b"\x20\x02\x00\x05")  # CONNACK: not authorized
+            return True
+        if typ == 1:
+            self.send(peer, b"\x20\x02\x00\x00")
+        elif typ == 8:
+            if self.refuse_subscribe:
+                self.unsubscribed.add(peer)
+                self.send(peer, packet(0x90, body[:2]+b"\x80"))
+                return False
+            self.unsubscribed.discard(peer)
+            self.send(peer, packet(0x90, body[:2]+b"\x00"))
+            if self.reports:
+                self.report(peer)
+        elif typ == 3:
+            size = int.from_bytes(body[:2], "big")
+            msg = json.loads(body[2+size:])
+            self.received.append(msg)
+            if peer in self.unsubscribed:
+                return False
+            if self.lease_s and msg.get("pushing", {}).get("command") == "start":
+                self.lease_until = time.monotonic() + self.lease_s
+            if self.reports and msg.get("pushing", {}).get("command") == "pushall":
+                self.report(peer)
+            elif self.answering and msg.get("info", {}).get("command") == "get_version":
+                self.report(peer, {"info": {"command": "get_version", "sequence_id": "0", "module": [
+                    {"name": "ota", "sw_ver": "01.09.00.00", "product_name": "P1S"}]}})
+        elif typ == 12:
+            self.send(peer, b"\xd0\x00")
+        elif typ == 14:
+            raise EOFError()  # DISCONNECT
+        return False
+
     def serve(self, raw):
         peer = None
         self.attempts += 1
@@ -181,81 +266,75 @@ class Broker:
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             raw.close()
             return
+        wake_r, wake_w = socket.socketpair()
+        wake_r.setblocking(False)
+        out = collections.deque()
         try:
             raw.settimeout(3)
             peer = self.ctx.wrap_socket(raw, server_side=True)
-            # Faults below own disconnect timing. A ten-second idle-read timeout here could
-            # close an otherwise healthy broker during slow FTPS/admission checks, before the
-            # intended socket-backpressure start, turning "unknown delivery" into "not sent".
-            # shutdown() in drop()/close() wakes this blocking read for fault injection/cleanup.
-            peer.settimeout(None)
+            # From here this thread alone reads and writes the socket, without blocking: replies,
+            # reports and broadcasts from other threads wait in out. block_reads stops reading only
+            # (socket backpressure), a blackholed link neither reads nor writes, and drop() asks
+            # this thread to shut the connection down.
+            peer.setblocking(False)
+            self.outbox[peer] = (out, wake_w)
             self.peers.add(peer)
             self.connections += 1
             self.maximum = max(self.maximum, len(self.peers))
             self.sample_held()
-            def read(n):
-                data = b""
-                while len(data)<n:
-                    while (self.block_reads or peer in self.blackholed) and not self.stop.is_set():
-                        time.sleep(.01)
-                    chunk = peer.recv(min(16384,n-len(data)))
+            inbuf, pending, ending = bytearray(), b"", False
+            while not self.stop.is_set():
+                if peer in self.kill:
+                    self.note(peer, "ended: dropped by the fault")
+                    socket.socket.shutdown(peer, socket.SHUT_RDWR)
+                    break
+                dead = peer in self.blackholed
+                reading = not (self.block_reads or dead or ending)
+                if not pending and out and not dead:
+                    pending = out.popleft()
+                if reading and peer.pending():
+                    readable, writable = [peer], []
+                else:
+                    readable, writable, _ = select.select([wake_r] + ([peer] if reading else []),
+                                                          [peer] if pending and not dead else [], [], .05)
+                if wake_r in readable:
+                    try:
+                        wake_r.recv(4096)
+                    except BlockingIOError:
+                        pass
+                if peer in writable:
+                    try:
+                        pending = pending[peer.send(pending):]
+                    except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
+                        pass
+                if ending and not pending and not out:
+                    break
+                if peer in readable:
+                    try:
+                        chunk = peer.recv(65536)
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        continue
                     if not chunk:
                         raise EOFError()
-                    data += chunk
-                return data
-            while not self.stop.is_set():
-                header = read(1)[0]
-                length, scale = 0, 1
-                for _ in range(4):
-                    b = read(1)[0]
-                    length += (b & 127) * scale
-                    if not b & 128:
-                        break
-                    scale *= 128
-                body = read(length)
-                typ = header >> 4
-                if typ == 1 and self.mode == "unauthorized":
-                    self.refusals += 1
-                    self.send(peer, b"\x20\x02\x00\x05")  # CONNACK: not authorized
-                    break
-                if typ == 1:
-                    self.send(peer, b"\x20\x02\x00\x00")
-                elif typ == 8:
-                    if self.refuse_subscribe:
-                        self.unsubscribed.add(peer)
-                        self.send(peer, packet(0x90, body[:2]+b"\x80"))
-                        continue
-                    self.unsubscribed.discard(peer)
-                    self.send(peer, packet(0x90, body[:2]+b"\x00"))
-                    if self.reports:
-                        self.report(peer)
-                elif typ == 3:
-                    size = int.from_bytes(body[:2], "big")
-                    msg = json.loads(body[2+size:])
-                    self.received.append(msg)
-                    if peer in self.unsubscribed:
-                        continue
-                    if self.lease_s and msg.get("pushing", {}).get("command") == "start":
-                        self.lease_until = time.monotonic() + self.lease_s
-                    if self.reports and msg.get("pushing", {}).get("command") == "pushall":
-                        self.report(peer)
-                    elif self.answering and msg.get("info", {}).get("command") == "get_version":
-                        self.report(peer, {"info": {"command": "get_version", "sequence_id": "0", "module": [
-                            {"name": "ota", "sw_ver": "01.09.00.00", "product_name": "P1S"}]}})
-                elif typ == 12:
-                    self.send(peer, b"\xd0\x00")
-                elif typ == 14:
-                    break
-        except (OSError, EOFError, ValueError):
-            pass
+                    inbuf += chunk
+                    while not ending and (parsed := self.take_packet(inbuf)) is not None:
+                        ending = self.handle(peer, *parsed)
+        except EOFError:
+            self.note(peer, "ended: client closed (EOF or DISCONNECT)")
+        except (OSError, ValueError) as exc:
+            self.note(peer, f"ended: {type(exc).__name__}: {exc}")
         finally:
             if peer:
+                self.outbox.pop(peer, None)
                 self.peers.discard(peer)
                 self.blackholed.discard(peer)
                 self.unsubscribed.discard(peer)
+                self.kill.discard(peer)
                 peer.close()
             else:
                 raw.close()
+            wake_r.close()
+            wake_w.close()
 
     def mutations(self):
         return [m for m in self.received if not (
@@ -266,16 +345,20 @@ class Broker:
         return sum(1 for m in self.received if m.get("pushing", {}).get("command") == "pushall")
 
     def drop(self):
-        # Shut down only; the peer's serve thread closes its own socket. Closing it here, while
-        # that thread is inside SSL_read, freed the fd number while OpenSSL still read from it: the
-        # next HTTP connection reused it and lost its first 5 bytes ("HTTP/") as a TLS record
-        # header ("illegal status line: 1.1 200 OK", also nightly 2026-11-02 seed 309119290).
-        for peer in list(self.peers):
+        # The peer's serve thread shuts its own connection down. Closing it here, while that thread
+        # was inside SSL_read, freed the fd number while OpenSSL still read from it: the next HTTP
+        # connection reused it and lost its first 5 bytes ("HTTP/") as a TLS record header
+        # ("illegal status line: 1.1 200 OK", also nightly 2026-11-02 seed 309119290).
+        dropped = list(self.peers)
+        for peer in dropped:
             self.peers.discard(peer)
-            try:
-                peer.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+            self.kill.add(peer)
+            self.wake(peer)
+        # Return once every dropped connection is shut down (its owner thread has ended), as when
+        # this closed them directly, so a fault takes effect before the next check.
+        deadline = time.monotonic() + 3
+        while any(peer in self.outbox for peer in dropped) and time.monotonic() < deadline:
+            time.sleep(.01)
 
     def close(self):
         self.stop.set()
@@ -368,6 +451,14 @@ async def campaign(seed, cycles):
                                 return
                             await asyncio.sleep(.05)
                         raise AssertionError(f"MCP still holds {held_mqtt_sockets()} MQTT socket(s) to a dead link")
+                    async def replacement_connected(connections):
+                        # A drop is seen by the server asynchronously; until the replacement connection
+                        # exists, health can still describe the dropped one.
+                        for _ in range(200):
+                            if broker.connections > connections:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError("no replacement MQTT connection after the drop")
                     async def refuses_writes():
                         refused = await call("set_bed_temp", temp=0, user_permission=True)
                         assert "telemetry_not_live" in str(refused), refused
@@ -474,8 +565,10 @@ async def campaign(seed, cycles):
                     text = unknown if isinstance(unknown, str) else json.dumps(unknown)
                     assert ("publish_unconfirmed" in text and '"sent": "unknown"' in text
                             and '"retried": false' in text), text[:1000]
+                    connections = broker.connections
                     broker.drop()
                     broker.block_reads = False
+                    await replacement_connected(connections)
                     await until_live()
                     await asyncio.sleep(.3)
                     assert len(broker.mutations()) == before, "unconfirmed packet was replayed"
@@ -922,14 +1015,32 @@ async def campaign(seed, cycles):
                     assert (await upload(prep["job_path"], "/uncertain.gcode.3mf")).get("admission")
                     before = len(broker.mutations())
                     broker.block_reads = True  # the reporter keeps telemetry live meanwhile
+                    connections = broker.connections
                     filler = await call("send_gcode", gcode=";HARNESS-ONLY-"+"x"*(8*1024*1024), user_permission=True)
                     assert "publish_unconfirmed" in str(filler), str(filler)[:500]
+                    # Other threads publish while that write is still pending in OpenSSL (supervisor timers,
+                    # bpm's watchdog, other tools). Written from their own threads, OpenSSL refused the
+                    # retry ("bad length") and the link dropped before the start (CI 2026-11-03, seeds
+                    # 3092584084, 1748876678). The link must stay up, so the start meets real backpressure.
+                    async def keep_refreshing(until):
+                        calls = 0
+                        while time.monotonic() < until:
+                            done = await call("trigger_printer_refresh", user_permission=True)
+                            assert "Refresh triggered" in str(done), done
+                            calls += 1
+                        return calls
+                    refreshes = sum(await asyncio.gather(*(keep_refreshing(time.monotonic() + 1.5)
+                                                           for _ in range(4))))
+                    assert broker.connections == connections and broker.peers, (
+                        f"link dropped under backpressure during {refreshes} concurrent refreshes")
                     uncertain = await start("/uncertain.gcode.3mf")
                     assert (uncertain.get("error"), uncertain.get("sent"), uncertain.get("retried")) == (
                         "publish_unconfirmed", "unknown", False), uncertain
                     assert uncertain["tool_result"].get("admission") == "consumed", uncertain
+                    connections = broker.connections
                     broker.drop()
                     broker.block_reads = False
+                    await replacement_connected(connections)
                     await until_live()
                     await asyncio.sleep(.3)
                     again = await start("/uncertain.gcode.3mf")
@@ -1023,6 +1134,7 @@ async def campaign(seed, cycles):
         except BaseException:
             log.flush(); log.seek(0)
             print(log.read()[-10000:], file=sys.stderr)
+            print("broker wire events:", *broker.wire_events[-30:], sep="\n  ", file=sys.stderr)
             raise
         finally:
             if proc.poll() is None:

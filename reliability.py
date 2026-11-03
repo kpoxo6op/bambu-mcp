@@ -20,6 +20,10 @@ What this module adds, without editing bpm (``ReliablePrinter`` subclasses ``Bam
   "starting" until gcode_state, bed and nozzle values have been processed again. ``health()``
   derives one status from those facts and never trusts bpm's ``recent_update`` or
   ``service_state`` alone.
+* paho's loop thread alone reads and writes the TLS socket (_loop_owns_socket_io). bpm runs
+  loop_forever on its own thread, so publish() used to write from the calling thread; with a large
+  write pending and other threads publishing, OpenSSL refused the retry ("bad length") and the link
+  dropped with writes in flight (E2E, CI 2026-11-03).
 * Last-mile publish guard. A request other than version/pushall is refused unless the loop
   thread is alive, paho is connected and telemetry is live. The paho return code is checked,
   and completion of the socket write is bounded. Nothing is retried or queued for later:
@@ -57,6 +61,7 @@ import re
 import threading
 import time
 
+import paho.mqtt.client as paho_client
 from bpm.bambucommands import ANNOUNCE_PUSH, ANNOUNCE_VERSION
 from bpm.bambuprinter import BambuPrinter
 from bpm.bambuproject import get_3mf_entry_by_name, get_project_info
@@ -160,6 +165,20 @@ def _bounded_backoff(initial: float, cap: float, count: int) -> float:
 def is_read_only_request(payload) -> bool:
     """True only for the version, pushall and push-start requests; any other payload is a printer write."""
     return _canonical(payload) in _READ_ONLY_REQUESTS
+
+
+def _loop_owns_socket_io(client, userdata, sock) -> None:
+    """paho on_socket_register_write: only the loop thread may touch the TLS socket.
+
+    bpm runs paho's loop_forever on its own thread, so paho's _thread is None and publish() wrote
+    the socket from whichever thread called it (paho _packet_queue -> loop_write), while the loop
+    thread read and wrote the same SSL object. Tools, the supervisor's timers and bpm's watchdog
+    publish from their own threads, and OpenSSL does not support one SSL object used from two
+    threads at once: the peer received records with a bad MAC and paho dropped the link as
+    "Unspecified error" (harness, 2026-11-03). With this callback set, publish() only queues the
+    packet and wakes the loop (ReliablePrinter.client adds the wake-up pair), and loop_forever
+    writes it when the socket is writable. Nothing is needed here; its presence is the switch.
+    """
 
 
 class _NotSent:
@@ -545,6 +564,14 @@ class ReliablePrinter(BambuPrinter):
     def client(self, value):
         if isinstance(value, _GuardedClient):
             value = object.__getattribute__(value, "_real")
+        if value is not None:
+            # Set before bpm calls connect(), so no packet is ever written from another thread.
+            value.on_socket_register_write = _loop_owns_socket_io
+            if getattr(value, "_sockpairW", None) is None:
+                # The wake-up pair paho's loop()/loop_start() create and loop_forever() does not:
+                # without it a queued publish waits for loop_forever's 1 s select timeout. paho
+                # (pinned 2.1.0) writes one byte to it per queued packet and closes it in __del__.
+                value._sockpairR, value._sockpairW = paho_client._socketpair_compat()
         self._client = value
         self._rel_proxy = None
 
