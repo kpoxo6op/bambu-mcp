@@ -184,7 +184,11 @@ class Broker:
         try:
             raw.settimeout(3)
             peer = self.ctx.wrap_socket(raw, server_side=True)
-            peer.settimeout(10)
+            # Faults below own disconnect timing. A ten-second idle-read timeout here could
+            # close an otherwise healthy broker during slow FTPS/admission checks, before the
+            # intended socket-backpressure start, turning "unknown delivery" into "not sent".
+            # shutdown() in drop()/close() wakes this blocking read for fault injection/cleanup.
+            peer.settimeout(None)
             self.peers.add(peer)
             self.connections += 1
             self.maximum = max(self.maximum, len(self.peers))
