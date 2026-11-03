@@ -15,11 +15,14 @@ import zipfile
 from PIL import Image
 
 
-def project_archive(marker=None, printer_model="Bambu Lab P1S", nozzle="0.4", plate="Textured PEI Plate"):
+def project_archive(marker=None, printer_model="Bambu Lab P1S", nozzle="0.4", plate="Textured PEI Plate",
+                    gcode_moves=0):
     """A sliced single-plate 3MF whose G-code header names its printer, nozzle and plate, as
-    Bambu Studio writes it. ``marker`` makes a distinct job (different bytes and hash)."""
+    Bambu Studio writes it. ``marker`` makes a distinct job (different bytes and hash).
+    ``gcode_moves`` appends that many move lines: deflated, as Bambu Studio stores the plate
+    G-code, the job stays small while the G-code the printer unpacks is large."""
     out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as z:
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("Metadata/plate_1.json", json.dumps({
             "bbox_objects":[{"name":"coupon_post.stl"}], "filament_ids":[1]}))
         z.writestr("Metadata/slice_info.config", '''<config><plate>
@@ -28,7 +31,8 @@ def project_archive(marker=None, printer_model="Bambu Lab P1S", nozzle="0.4", pl
           <filament id="1" type="PETG" color="#000000"/></plate></config>''')
         z.writestr("Metadata/plate_1.gcode", "; CONFIG_BLOCK_START\n; filament_type = PETG\n"
                    f"; printer_model = {printer_model}\n; nozzle_diameter = {nozzle}\n"
-                   f"; curr_bed_type = {plate}\n; CONFIG_BLOCK_END\n")
+                   f"; curr_bed_type = {plate}\n; CONFIG_BLOCK_END\n"
+                   + "G1 X128.000 Y128.000 E0.03125 F1800\n" * gcode_moves)
         if marker is not None:
             z.writestr("Metadata/fixture_job.txt", str(marker))
     return out.getvalue()  # intentionally no thumbnail or top image
@@ -60,6 +64,15 @@ class Listener:
         self.listener.close()
 
 
+CARD_RECORD = "bambu-mcp-card.json"
+
+
+def card_record(card_id="0" * 32, data_bytes=1 << 30, cluster_bytes=32768):
+    """The record ops/attest_sd_card.py writes on a checked card (the fixture card is 1 GiB)."""
+    return json.dumps({"schema": "bambu-mcp-sd-card/1", "card_id": card_id, "data_bytes": data_bytes,
+                       "cluster_bytes": cluster_bytes, "attested_at": "2026-11-03T00:00:00Z"}).encode()
+
+
 class FTPSPeer(Listener):
     def __init__(self, ctx):
         self.reset = True
@@ -68,7 +81,13 @@ class FTPSPeer(Listener):
         self.downloads = []
         self.stores = []
         self.commands = []
-        self.files = {"fixture-job.gcode.3mf":project_archive(), "broken.gcode.3mf":b"broken archive"}
+        self.files = {"fixture-job.gcode.3mf":project_archive(), "broken.gcode.3mf":b"broken archive",
+                      CARD_RECORD:card_record()}
+        # Listed size of files whose bytes nobody reads here (a dashcam's videos filling the card).
+        self.sizes = {}
+        # Folders below the root: path -> LIST rows, or None for a folder the printer refuses (550).
+        self.folders = {}
+        self.root_rows = []  # extra raw rows in the root listing (folders, rows bpm skips)
         super().__init__(ctx, 990)
 
     def serve(self, raw):
@@ -106,9 +125,14 @@ class FTPSPeer(Listener):
                         if verb=="PASV": reply(f"227 Entering Passive Mode (127,0,0,1,{port//256},{port%256})")
                         else: reply(f"229 Entering Extended Passive Mode (|||{port}|)")
                     elif verb in ("LIST","RETR"):
-                        if verb=="LIST":
-                            data="".join(f"-rw-r--r-- 1 test test {len(v)} Jan 01 2026 {n}\r\n"
-                                         for n,v in self.files.items()).encode()
+                        if verb=="LIST" and arg.strip("/") in self.folders:
+                            rows=self.folders[arg.strip("/")]
+                            if rows is None:
+                                reply("550 Permission denied"); continue
+                            data="".join(f"{r}\r\n" for r in rows).encode()
+                        elif verb=="LIST":
+                            data="".join([f"-rw-r--r-- 1 test test {self.sizes.get(n, len(v))} Jan 01 2026 {n}\r\n"
+                                          for n,v in self.files.items()]+[f"{r}\r\n" for r in self.root_rows]).encode()
                         else:
                             name=arg.lstrip("/")
                             if name not in self.files:

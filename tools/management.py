@@ -473,6 +473,15 @@ def get_printer_connection_status(name: str) -> dict:
         a keep-alive request every 5 minutes while live). ``stream_requests`` counts requests asking
         the printer to resume streaming reports, sent after 20 s without a status report. Printer writes are refused unless ``writable`` is True; state tools return
         ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
+        ``telemetry.storage`` (no I/O): ``sd_card`` is the SD card state the printer reported on
+        this connection (``state`` absent, normal, abnormal, read_only or None when not yet
+        reported; ``source`` the MQTT field; ``age_s``), ``timelapse_storage_free_bytes`` the
+        firmware's timelapse-storage free figure if it sends one (a P1 does not; not used for
+        admission, since it need not be the SD card), and
+        ``last_space_check`` the latest upload/start space measurement (``verdict`` ok or the
+        refusal code, ``available_bytes``, ``required_bytes``, ``card_id``, ``checked_at``,
+        ``age_s``) or None. Free space is measured only by ``upload_file`` and ``print_file``
+        (docs/storage-space.md); nothing here claims space it has not measured.
     """
     log.debug("get_printer_connection_status: called for name=%s", name)
     configured_names = auth.get_configured_printer_names()

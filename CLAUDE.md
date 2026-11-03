@@ -23,6 +23,7 @@
 - BPM is considered stable — do not modify it to solve MCP-layer problems
 - No tool may open its own direct FTPS/MQTT/socket/HTTP connection (camera streaming excepted)
 - No FTPS while the printer reports a job: `ReliablePrinter.ftp_connection` refuses unless gcode_state is IDLE/FINISH/FAILED (2026-11-03: the P1S sent no status reports while a 3MF download ran during an SD print)
+- SD card space: `storage_space.py` refuses an admitted upload/start unless the card's attestation record (`ops/attest_sd_card.py`, fsck-checked capacity) minus the FTPS listing covers the job + unpacked plate G-code + 64 MiB; unknown refuses; never delete or format to make room. See `docs/storage-space.md` (2026-11-03: a full card failed the start with HMS 0500-4003)
 - Prints start only through `print_admission.py`: `prepare_print_job` (operator-configured preparer, `BAMBU_PREFLIGHT_COMMAND_JSON`) → `upload_file` → `print_file`; the publish guard refuses any other start, SD-card or extruding G-code. See `docs/print-admission.md`; never add an override
 - REST API server, camera stream servers and their relay children draw ports from a shared `PortPool` (default 49152-49251)
 - Port discovery: `get_server_info()` MCP tool or `GET /api/server_info` — never hardcode ports

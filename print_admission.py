@@ -229,6 +229,8 @@ class Receipt:
     md5: str
     size: int
     plates: tuple[int, ...]
+    # (plate, bytes of Metadata/plate_<N>.gcode): what the printer unpacks to its card to print it.
+    plate_gcode_bytes: tuple[tuple[int, int], ...]
     target: Target
     run_dir: str
     report_sha256: str
@@ -237,7 +239,8 @@ class Receipt:
 
     def public(self) -> dict:
         return {"receipt_id": self.id, "part": self.part, "job_path": self.job_path, "sha256": self.sha256,
-                "md5": self.md5, "size": self.size, "plates": list(self.plates), "target": self.target.public(),
+                "md5": self.md5, "size": self.size, "plates": list(self.plates),
+                "plate_gcode_bytes": {str(p): n for p, n in self.plate_gcode_bytes}, "target": self.target.public(),
                 "run_dir": self.run_dir, "report_sha256": self.report_sha256,
                 "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.created))}
 
@@ -252,12 +255,15 @@ class Binding:
     md5: str
     size: int
     plates: tuple[int, ...]
+    plate_gcode_bytes: tuple[tuple[int, int], ...]
     target: Target
+    card_id: str                  # the SD card record the upload was measured against
     bound_at: float
 
     def public(self) -> dict:
         return {"receipt_id": self.receipt_id, "part": self.part, "remote_path": self.path,
-                "sha256": self.sha256, "plates": list(self.plates), "target": self.target.public()}
+                "sha256": self.sha256, "plates": list(self.plates), "target": self.target.public(),
+                "card_id": self.card_id}
 
 
 _lock = threading.Lock()
@@ -311,7 +317,7 @@ def _report_problems(out: Path, part: str):
         return None
 
 
-def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int, ...], "Target"]:
+def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int, ...], tuple, "Target"]:
     """Check the finished run against the admission rules; see docs/print-admission.md."""
     def expect(ok, why):
         if not ok:
@@ -370,6 +376,9 @@ def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int
                 plates = tuple(sorted({int(m.group(1)) for n in names
                                        if (m := re.fullmatch(r"Metadata/plate_(\d{1,3})\.gcode", n))}))
                 expect(bool(plates), "the job has no Metadata/plate_<N>.gcode")
+                # What the printer unpacks to its card for each plate. Read in full, so the
+                # member's CRC proves the size (a corrupt member fails here).
+                gcode_bytes = tuple((p, _member_bytes(zf, f"Metadata/plate_{p}.gcode")) for p in plates)
                 # The G-code the printer runs must itself say it was sliced for the target.
                 for plate in plates:
                     declared = _gcode_config(zf, f"Metadata/plate_{plate}.gcode")
@@ -384,7 +393,7 @@ def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int
                if k in report}
     summary["part"] = {k: entry.get(k) for k in ("stl", "triangles", "slicer", "minutes", "grams", "watch",
                                                   "geometry") if k in entry}
-    return summary, hashlib.sha256(raw).hexdigest(), sha, md5, size, plates, target
+    return summary, hashlib.sha256(raw).hexdigest(), sha, md5, size, plates, gcode_bytes, target
 
 
 def _target(raw, expect) -> Target:
@@ -408,6 +417,14 @@ def _target(raw, expect) -> Target:
            f"target plate_type {plate_type!r} is not a known Bambu Studio bed type")
     return Target(printer_model=model, model=qualified[model], nozzle_diameter=tuple(nozzles),
                   plate_type=plate_type, plate=PLATE_TYPES[plate_type])
+
+
+def _member_bytes(zf: zipfile.ZipFile, name: str) -> int:
+    size = 0
+    with zf.open(name) as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            size += len(chunk)
+    return size
 
 
 def _gcode_config(zf: zipfile.ZipFile, name: str, limit: int = 4 * 1024 * 1024) -> dict[str, str]:
@@ -495,10 +512,11 @@ def prepare(part: str) -> dict:
         if code != 0:
             raise Refused("preflight_failed", f"The preparer exited with status {code}. The job is not admitted.",
                           report=_report_problems(out, part), log=str(log_path), log_tail=_tail(log_path))
-        summary, report_sha, sha, md5, size, plates, target = _validate(out, part)
+        summary, report_sha, sha, md5, size, plates, gcode_bytes, target = _validate(out, part)
         summary.update(command=argv, command_sha256=tools, duration_s=duration, log=str(log_path))
         receipt = Receipt(id=secrets.token_hex(8), part=part, job_path=str(out / part / f"{part}.gcode.3mf"),
-                          sha256=sha, md5=md5, size=size, plates=plates, target=target, run_dir=str(out),
+                          sha256=sha, md5=md5, size=size, plates=plates, plate_gcode_bytes=gcode_bytes,
+                          target=target, run_dir=str(out),
                           report_sha256=report_sha, created=time.time(), summary=summary)
         with _lock:
             _receipts[receipt.id] = receipt
@@ -566,9 +584,10 @@ def _key(printer: str, path: str) -> tuple[str, str]:
     return printer, path.casefold()  # SD cards are FAT/exFAT: names are case-insensitive
 
 
-def bind(printer: str, path: str, receipt: Receipt) -> Binding:
+def bind(printer: str, path: str, receipt: Receipt, card_id: str) -> Binding:
     b = Binding(printer=printer, path=path, receipt_id=receipt.id, part=receipt.part, sha256=receipt.sha256,
-                md5=receipt.md5, size=receipt.size, plates=receipt.plates, target=receipt.target,
+                md5=receipt.md5, size=receipt.size, plates=receipt.plates,
+                plate_gcode_bytes=receipt.plate_gcode_bytes, target=receipt.target, card_id=card_id,
                 bound_at=time.time())
     with _lock:
         _bindings[_key(printer, path)] = b

@@ -687,7 +687,7 @@ sends nothing to any printer.
 **Returns**
 
 Success: ``{"success": True, "receipt_id", "part", "job_path", "sha256", "md5", "size",
-"plates", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
+"plates", "plate_gcode_bytes", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
 "run_dir", "report_sha256", "prepared_at", "report": <summary copied from the
 preparer's report, incl. command, command_sha256, slicer, minutes, grams, watch>,
 "valid_until": "server restart", "next": <the upload call to make>}``. Pass
@@ -787,6 +787,11 @@ refuses; the configured name is never used), one nozzle, and the prepared nozzle
 as the printer reported it on the current connection. The start names the prepared plate
 type. Software cannot sense the plate or filament physically on the printer; that remains
 an observation for the camera or a person.
+STORAGE: the printer unpacks the plate's G-code onto its SD card before printing (several
+times the compressed job). After the card verification the server lists the card again and
+requires room for that G-code plus a 64 MiB reserve, on the same card the job was uploaded
+to (its ``/bambu-mcp-card.json`` record), with an SD state of normal reported on this
+connection (docs/storage-space.md). A refusal keeps the admission (except on another card).
 
 **Sibling disambiguation:** ``print_file`` starts the print; ``preview_ams_mapping`` resolves
 the same ams_mapping without printing and is the read-only step before it.
@@ -817,7 +822,8 @@ path>, "plate_num": <plate_num>, "bed_type": <resolved bed type name>, "use_ams"
 <bool>, "ams_mapping": <JSON string sent, empty when none>, "matches": <list of
 per-filament match dicts from the live-spool resolution, empty when ``ams_mapping``
 was provided or ``use_ams`` is False>, "admission": {"receipt_id", "part",
-"remote_path", "sha256", "plates", "md5", "consumed": True}}``.
+"remote_path", "sha256", "plates", "target", "card_id", "md5", "consumed": True},
+"storage": <space evidence, as for upload_file>}``.
 Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
 ``user_permission`` is False, ``"Printer '<name>' not connected"``, the active-print
 block ``"Blocked: '<name>' is currently <state>. ..."``, or
@@ -828,7 +834,10 @@ again before another attempt). Admission refusals, all sent before any command, 
 ``remote_verification_failed`` (FTPS error; the admission is kept), ``invalid_bed_type``,
 ``bed_type_mismatch``, ``printer_model_unknown``, ``printer_model_mismatch``,
 ``printer_not_qualified``, ``nozzle_unknown``, ``nozzle_mismatch``,
-``start_md5_unavailable``, ``invalid_ams_mapping``, ``print_metadata_unavailable``, ``filament_change_in_progress``, ``invalid_remote_path``
+``start_md5_unavailable``, ``storage_state_unknown``, ``storage_no_card``,
+``storage_card_abnormal``, ``storage_card_read_only``, ``storage_unattested``,
+``storage_unknown``, ``storage_insufficient`` (with ``storage``: available, required and
+their basis), ``storage_card_changed`` (admission dropped), ``invalid_ams_mapping``, ``print_metadata_unavailable``, ``filament_change_in_progress``, ``invalid_remote_path``
 or ``file_operation_busy``. When the live-spool resolution fails, the return is the
 resolution payload of ``preview_ams_mapping`` (``file_path``, ``plate_num``,
 ``filaments``, ``resolved_ams_mapping``, ``ams_mapping_json``, ``matches``,
@@ -948,7 +957,8 @@ success (no listing is returned). Errors are ``{"error": str}``: the
 ``_permission_denied`` refusal when ``user_permission`` is False, ``"Printer '<name>'
 not connected"``, or ``"Error renaming file on '<name>': <exception>"``; or
 ``{"error": code, "detail": str}`` with code ``rename_creates_job`` (a non-printable
-name renamed to a ``.3mf``/``.gcode`` name), ``invalid_remote_path`` or
+name renamed to a ``.3mf``/``.gcode`` name), ``storage_record_protected`` (destination is
+the SD card record), ``invalid_remote_path`` or
 ``file_operation_busy``.
 
 **Notes**
@@ -989,6 +999,14 @@ start. Any earlier binding for the same path is dropped before the transfer, and
 transfer binds nothing. Arbitrary sliced files, edited jobs and jobs from a previous server
 run are refused; there is no override.
 
+**STORAGE:** before a prepared job is transferred, the server lists the whole card and reads
+its ``/bambu-mcp-card.json`` record (written by ``ops/attest_sd_card.py`` on a computer:
+the printer reports neither capacity nor free space). Available = the recorded data area
+minus every listed file and folder in whole clusters. It must cover the job, the largest
+plate G-code the printer will unpack and a 64 MiB reserve; a file being replaced is not
+credited. The printer must have reported a normal SD card on this connection. Otherwise
+nothing is written. This server never deletes files to make room.
+
 **Sibling disambiguation:** ``upload_file`` copies a file from this host to the printer;
 ``download_file`` copies the other way, from the printer to this host.
 ``rename_sdcard_file`` moves a file that is already on the card without re-uploading it.
@@ -1004,14 +1022,24 @@ run are refused; there is no override.
 
 ``{"success": True, "remote_path": <normalized remote path>, "contents": <refreshed SD
 card tree>}`` on success, plus ``"admission": {"receipt_id", "part", "remote_path",
-"sha256", "plates"}`` for a prepared job. ``contents`` is the printer library's SD card
+"sha256", "plates", "target", "card_id"}`` and ``"storage": {"card_id", "attested_at",
+"data_bytes", "cluster_bytes", "listed_allocated_bytes", "files", "folders",
+"available_bytes", "listing_s", "required_bytes",
+"required": {"job", "unpacked_gcode", "reserve"}, "sd_card": {"state", "source",
+"age_s"}}`` for a prepared job. ``contents`` is the printer library's SD card
 listing taken after the upload; null when that listing failed. A prepared job whose
 post-transfer step failed is downloaded again and admitted only if its bytes match,
 with a ``"warning"``. Errors are ``{"error": str}`` (permission refusal, ``"Printer
 '<name>' not connected"``, ``"Error uploading file: <exception>"``) or ``{"error":
-code, "detail": str}`` with code ``job_not_prepared``, ``job_modified``,
-``remote_not_project``, ``invalid_remote_path``, ``upload_failed`` or
-``file_operation_busy``.
+code, "detail": str}`` with code ``storage_record_protected`` (the SD card record
+``/bambu-mcp-card.json`` is written only by ``ops/attest_sd_card.py``),
+``job_not_prepared``, ``job_modified``,
+``remote_not_project``, ``invalid_remote_path``, ``upload_failed``,
+``file_operation_busy`` or, with nothing written, ``storage_state_unknown``,
+``storage_no_card``, ``storage_card_abnormal``, ``storage_card_read_only``,
+``storage_unattested`` (no card record), ``storage_unknown`` (record
+unreadable, or a folder or listing row the card listing cannot account for) or ``storage_insufficient`` (with ``storage``: available, required and
+their basis).
 
 **Notes**
 

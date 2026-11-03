@@ -127,7 +127,7 @@ def main():
     seeds = list(dict.fromkeys(corpus+[seed+i for i in range(args.rounds)]))
     jobs = [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
     for i, cmd in enumerate(jobs):
-        result = run_child(cmd, args.python, run/f"{i:02}.log", max(90, args.cycles*12))
+        result = run_child(cmd, args.python, run/f"{i:02}.log", max(120, args.cycles*15))
         report["results"].append(result)
         print(json.dumps(result), flush=True)
         (run/"report.json").write_text(json.dumps(report, indent=2))
