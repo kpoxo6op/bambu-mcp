@@ -64,6 +64,7 @@ class FTPSPeer(Listener):
     def __init__(self, ctx):
         self.reset = True
         self.resets = 0
+        self.connections = 0  # every accepted control connection, reset or served
         self.downloads = []
         self.stores = []
         self.commands = []
@@ -73,6 +74,7 @@ class FTPSPeer(Listener):
     def serve(self, raw):
         passive = None
         rename_from = None
+        self.connections += 1
         if self.reset:
             self.resets += 1
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii",1,0))
