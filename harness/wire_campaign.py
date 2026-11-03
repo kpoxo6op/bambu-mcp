@@ -22,13 +22,14 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 
 if os.environ.get("BAMBU_HARNESS_ISOLATED") != "1":
     raise SystemExit("Use harness/run.py; network isolation is required")
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from printer_peers import FTPSPeer, CameraPeer
+from printer_peers import CARD_RECORD, FTPSPeer, CameraPeer, card_record
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -98,6 +99,9 @@ class Broker:
         # and its status reports carry the installed nozzle as a P1S does (None: not reported).
         self.serial = "01P00TESTONLY"
         self.nozzle = "0.4"
+        # SD card state in each status report, as a P1 sends it: the sdcard bool and home_flag
+        # bits 8-9 (Bambu Studio DevStorage). None: neither field is sent.
+        self.sd = "normal"
         self.attempts = 0
         self.refusals = 0
         # Peers whose link went dead: never read from or written to again, no PINGRESP.
@@ -179,6 +183,10 @@ class Broker:
                     "task_id": "77" if self.running else "0", "layer_num": 2, "total_layer_num": 115}}
             if self.nozzle is not None:
                 data["print"]["nozzle_diameter"] = self.nozzle
+            if self.sd is not None:
+                present, code = {"absent": (False, 0), "normal": (True, 1), "abnormal": (True, 2),
+                                 "read_only": (True, 3)}[self.sd]
+                data["print"].update(sdcard=present, home_flag=code << 8)
         topic = f"device/{self.serial}/report".encode()
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send(peer, packet(0x30, len(topic).to_bytes(2, "big")+topic+body))
@@ -930,6 +938,75 @@ async def campaign(seed, cycles):
                     assert [m["print"]["command"] for m in commands] == ["gcode_line", "pause"], commands
                     events.append({"contract":"raw MQTT and G-code cannot start, write SD or extrude; maintenance still sent",
                                    "refused":13, "sent":2})
+                    # SD card space (docs/storage-space.md). 2026-11-03: an admitted 1.4 MB job was uploaded,
+                    # verified and started on a card with 38 free clusters; the P1S could not unpack its 6.9 MB
+                    # plate G-code (PREPARE -> IDLE, HMS 0500-4003). The fixture card is attested at 1 GiB; a
+                    # listed-only filler stands for the dashcam videos. big_gcode is a ~0.1 MB job whose G-code
+                    # unpacks to 24 MiB, so the job alone fits where its unpacked G-code does not.
+                    MiB = 1 << 20
+                    def card_available(mib):
+                        ftps.sizes["MOVE-dashcam.mp4"] = (1024 - mib) * MiB
+                        ftps.files.setdefault("MOVE-dashcam.mp4", b"")
+                    async def space_check():
+                        return (await call("get_printer_connection_status"))["telemetry"]["storage"]["last_space_check"]
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    big = await prepare("big_gcode")
+                    with zipfile.ZipFile(big["job_path"]) as z:
+                        unpacked = z.getinfo("Metadata/plate_1.gcode").file_size  # what the printer writes to /cache
+                    assert big.get("success") and unpacked > 24 * MiB > 10 * big["size"], big
+                    card_available(76)
+                    refused = await upload(big["job_path"], "/big.gcode.3mf")
+                    assert refused.get("error") == "storage_insufficient", refused
+                    space = refused["storage"]
+                    assert space["available_bytes"] < space["required_bytes"], space
+                    assert space["available_bytes"] >= space["required"]["job"] + space["required"]["reserve"], space
+                    assert space["required"]["unpacked_gcode"] >= unpacked == big["plate_gcode_bytes"]["1"], space
+                    assert (await space_check())["verdict"] == "storage_insufficient"
+                    assert len(ftps.stores) == stores and "big.gcode.3mf" not in ftps.files, ftps.stores[stores:]
+                    assert (await start("/big.gcode.3mf")).get("error") == "print_not_admitted"
+                    # Room for the upload and its G-code; then the card fills (another writer) before the start.
+                    card_available(100)
+                    up = await upload(big["job_path"], "/big.gcode.3mf")
+                    assert up.get("admission") and up["storage"]["available_bytes"] >= up["storage"]["required_bytes"], up
+                    assert (await space_check())["verdict"] == "ok"
+                    card_available(80)
+                    refused = await start("/big.gcode.3mf")
+                    assert refused.get("error") == "storage_insufficient" and "admission is kept" in refused["detail"], refused
+                    assert refused["storage"]["required"]["unpacked_gcode"] >= unpacked, refused
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    card_available(200)
+                    printed = await start("/big.gcode.3mf")
+                    assert "error" not in printed and printed["storage"]["card_id"] == "0" * 32, printed
+                    await asyncio.sleep(.1)
+                    commands = broker.mutations()[before:]
+                    assert len(commands) == 1 and commands[0]["print"]["command"] == "project_file", commands
+                    assert commands[0]["print"]["md5"] == hashlib.md5(Path(big["job_path"]).read_bytes()).hexdigest().upper()
+                    events.append({"contract":"a job whose unpacked G-code does not fit is not uploaded; space is "
+                                   "measured again before the start (admission kept); a start with room reaches "
+                                   "the wire once", "sent":1})
+                    # Unknown is never treated as room: no card record, a card the printer reports read-only,
+                    # an SD state not reported on this connection, and another card at the start.
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    record = ftps.files.pop(CARD_RECORD)
+                    refused = await upload(prep["job_path"], "/space.gcode.3mf")
+                    assert refused.get("error") == "storage_unattested", refused
+                    ftps.files[CARD_RECORD] = record
+                    broker.sd = "read_only"
+                    await health_until(lambda h: h["storage"]["sd_card"]["state"] == "read_only", "read-only card", 5)
+                    refused = await upload(prep["job_path"], "/space.gcode.3mf")
+                    assert refused.get("error") == "storage_card_read_only", refused
+                    assert len(ftps.stores) == stores, ftps.stores[stores:]
+                    broker.sd = "normal"
+                    await health_until(lambda h: h["storage"]["sd_card"]["state"] == "normal", "SD state not reported", 5)
+                    assert (await upload(prep["job_path"], "/swap.gcode.3mf")).get("admission")
+                    ftps.files[CARD_RECORD] = card_record(card_id="1" * 32)  # another card holding the same file
+                    refused = await start("/swap.gcode.3mf")
+                    assert refused.get("error") == "storage_card_changed", refused
+                    assert (await start("/swap.gcode.3mf")).get("error") == "print_not_admitted"
+                    ftps.files[CARD_RECORD] = record
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"unattested card, read-only card and a replaced card refuse before "
+                                   "any write or start", "sent":0})
                     # The admitted path: plate and options are checked before the admission is used, the
                     # card is re-read before the start, and exactly one bound start reaches the wire.
                     before, stores = len(broker.mutations()), len(ftps.stores)
@@ -956,14 +1033,20 @@ async def campaign(seed, cycles):
                         await nozzle_reported(invalid)
                         refused = await start("/admitted.gcode.3mf")
                         assert refused.get("error") == "nozzle_unknown", (invalid, refused)
-                    broker.nozzle = None
+                    # Neither the nozzle nor the SD card state reported before a reconnect counts for the new link.
+                    broker.nozzle, broker.sd = None, None
                     broker.drop()
                     await until_live()
                     await nozzle_reported(None)
                     refused = await start("/admitted.gcode.3mf")
                     assert refused.get("error") == "nozzle_unknown", refused
-                    broker.nozzle = "0.4"
+                    await health_until(lambda h: h["storage"]["sd_card"]["state"] is None, "pre-reconnect SD state kept", 5)
+                    stores = len(ftps.stores)
+                    refused = await upload(prep["job_path"], "/space.gcode.3mf")
+                    assert refused.get("error") == "storage_state_unknown" and len(ftps.stores) == stores, refused
+                    broker.nozzle, broker.sd = "0.4", "normal"
                     await nozzle_reported("0.4")
+                    await health_until(lambda h: h["storage"]["sd_card"]["state"] == "normal", "SD state not reported", 5)
                     ftps.files["admitted.gcode.3mf"] = job[:-1] + bytes([job[-1] ^ 1])  # replaced on the card
                     refused = await start("/admitted.gcode.3mf")
                     assert refused.get("error") == "remote_file_mismatch", refused
@@ -989,8 +1072,8 @@ async def campaign(seed, cycles):
                     again = await start("/admitted.gcode.3mf")
                     assert again.get("error") == "print_not_admitted", again
                     assert len(broker.mutations()) == before + 1, broker.mutations()[before:]
-                    events.append({"contract":"prepared job: wrong plate, bed type, nozzle, unreported nozzle and "
-                                   "remote tamper refused; verified start names the prepared plate and MD5, "
+                    events.append({"contract":"prepared job: wrong plate, bed type, nozzle, unreported nozzle or SD "
+                                   "state and remote tamper refused; verified start names the prepared plate and MD5, "
                                    "reaches the wire once; repeat refused", "sent":1})
                     # Upload, rename and delete drop the admissions they could invalidate, first. The card
                     # is case-insensitive, so a rename onto another spelling of the path counts.

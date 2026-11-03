@@ -132,6 +132,33 @@ class SdCardBusy(OSError):
 _tls = threading.local()
 
 
+def _sd_card_state(status: dict) -> tuple[int, str] | None:
+    """SD card state as Bambu Studio decodes it (DevStorage::SdcardState: 0 none, 1 normal,
+    2 abnormal, 3 read-only): print.aux bits 12-13, else home_flag bits 8-9, else the legacy
+    sdcard bool. sdcard false always reads as no card."""
+    if status.get("sdcard") is False:
+        return 0, "sdcard"
+    try:
+        if isinstance(status.get("aux"), str) and status["aux"]:
+            return (int(status["aux"], 16) >> 12) & 3, "aux"
+        if "home_flag" in status:
+            return (int(status["home_flag"]) >> 8) & 3, "home_flag"
+    except (TypeError, ValueError):
+        return None
+    if status.get("sdcard") is True:
+        return 1, "sdcard"
+    return None
+
+
+def _external_free_bytes(status: dict) -> int | None:
+    """tl_external_free_kb (KiB, Bambu Studio DevStorage) from device.cam or ipcam, as bytes."""
+    for section in ((status.get("device") or {}).get("cam"), status.get("ipcam")):
+        value = section.get("tl_external_free_kb") if isinstance(section, dict) else None
+        if type(value) is int and value >= 0:
+            return value * 1024
+    return None
+
+
 def _in_mqtt_callback() -> bool:
     return bool(getattr(_tls, "in_message", False))
 
@@ -323,6 +350,10 @@ class ReliablePrinter(BambuPrinter):
         # nozzle_diameter exactly as the printer reported it since this connection began; print
         # admission matches a job to it. Never carried across a reconnect (the nozzle may change).
         self._rel_nozzle: str | None = None
+        # SD card state (code, field, monotonic time) and any firmware free-space figure (bytes),
+        # as reported on this connection; never carried across a reconnect (the card may change).
+        self._rel_sd: tuple[int, str, float] | None = None
+        self._rel_ext_free: int | None = None
 
     def _rel_mark_incomplete(self, why: str) -> None:
         with self._rel_lock:
@@ -338,9 +369,14 @@ class ReliablePrinter(BambuPrinter):
             keys.add("bed")
         if "nozzle_temper" in status or "device" in status:
             keys.add("nozzle")
+        sd, free = _sd_card_state(status), _external_free_bytes(status)
         with self._rel_lock:
             if "nozzle_diameter" in status:
                 self._rel_nozzle = str(status["nozzle_diameter"])
+            if sd is not None:
+                self._rel_sd = (*sd, time.monotonic())
+            if free is not None:
+                self._rel_ext_free = free
             if {"gcode_state", "bed", "nozzle"} <= keys:  # one frame with the full state: a full report
                 self._rel_full_unanswered = 0
                 self._rel_last_full_report = time.monotonic()
@@ -445,6 +481,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_covered = set()
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
+                self._rel_sd = self._rel_ext_free = None
                 # A new connection may be answered where the last one was not.
                 self._rel_full_unanswered = 0
                 self._rel_last_pushall_req = 0.0
@@ -464,6 +501,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_covered = set()
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
+                self._rel_sd = self._rel_ext_free = None
                 self._rel_last_error = f"mqtt disconnected: {reason_code}"
             if was_connected:  # once per lost connection, not per failed retry
                 log.warning("ReliablePrinter: MQTT disconnected (%s); telemetry not live until it reconnects",
@@ -490,6 +528,16 @@ class ReliablePrinter(BambuPrinter):
         """The nozzle_diameter the printer reported on this connection, or None (not yet / reconnected)."""
         with self._rel_lock:
             return self._rel_nozzle
+
+    def reported_sd_card(self) -> tuple[int, str, float] | None:
+        """(SdcardState code, field it came from, monotonic time) reported on this connection, or None."""
+        with self._rel_lock:
+            return self._rel_sd
+
+    def reported_external_free_bytes(self) -> int | None:
+        """Free bytes of external storage as the firmware reported them on this connection, or None."""
+        with self._rel_lock:
+            return self._rel_ext_free
 
     def _rel_full_state_wait(self, now: float) -> float:
         """Seconds until another full-state request may be sent (caller holds _rel_lock)."""
@@ -1076,6 +1124,13 @@ def health(name: str) -> dict:
         base.update({"status": "unknown", "reason": f"health failed: {exc}", "live": False, "writable": False})
         return base
     base.update(snap)
+    try:
+        import storage_space
+        base["storage"] = {"sd_card": storage_space.sd_state(p),
+                           "firmware_reported_free_bytes": p.reported_external_free_bytes(),
+                           "last_space_check": storage_space.last_check(name)}
+    except Exception as exc:
+        base["storage"] = {"error": f"{type(exc).__name__}: {exc}"}
     base["writable"] = bool(snap["live"] and base["supervisor_alive"])
     if snap["live"] and not base["supervisor_alive"]:
         base["reason"] = "telemetry current, but the session supervisor is not running"

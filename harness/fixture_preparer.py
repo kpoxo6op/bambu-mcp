@@ -21,7 +21,10 @@ out.mkdir()  # a new run never reuses a directory; an existing one fails here
 (out / part).mkdir()
 job = out / part / f"{part}.gcode.3mf"
 # job_target_mismatch: the report names the P1S 0.4 target, but the job's G-code was sliced for 0.6.
-job.write_bytes(project_archive(marker=part, nozzle="0.6" if part == "job_target_mismatch" else "0.4"))
+# big_gcode: a small deflated job whose plate G-code unpacks to 24 MiB (the 2026-11-03 job was 1.4 MB
+# compressed and 6.9 MB unpacked).
+job.write_bytes(project_archive(marker=part, nozzle="0.6" if part == "job_target_mismatch" else "0.4",
+                                gcode_moves=24 * 1024 * 1024 // 36 if part == "big_gcode" else 0))
 entry = {"stl": "0" * 64, "triangles": 12, "problems": [],
          "geometry": {"pass": True, "policy_version": 1, "policy": "fixture"},
          "target": {"printer_model": "Bambu Lab P1S", "nozzle_diameter": ["0.4"], "plate_type": "Textured PEI Plate"},

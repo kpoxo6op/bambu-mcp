@@ -702,7 +702,7 @@ def prepare_print_job(part: str) -> dict:
 
     Returns:
         Success: ``{"success": True, "receipt_id", "part", "job_path", "sha256", "md5", "size",
-        "plates", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
+        "plates", "plate_gcode_bytes", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
         "run_dir", "report_sha256", "prepared_at", "report": <summary copied from the
         preparer's report, incl. command, command_sha256, slicer, minutes, grams, watch>,
         "valid_until": "server restart", "next": <the upload call to make>}``. Pass
@@ -734,6 +734,7 @@ def _guarded_upload(name: str, printer, local_path: str, remote_path: str) -> di
     """
     import shutil
     import print_admission as pa
+    import storage_space
     with pa.file_lock(name):
         if not (pa.is_job_name(local_path) or pa.is_job_name(remote_path)):
             # Not a printable job either way. It cannot become one later: rename refuses a
@@ -742,6 +743,8 @@ def _guarded_upload(name: str, printer, local_path: str, remote_path: str) -> di
             return {"success": True, "remote_path": remote, "contents": printer.upload_sdcard_file(local_path, remote)}
         receipt, remote, snapshot, tmpdir = pa.snapshot_for_upload(local_path, remote_path)
         try:
+            # Before anything changes: the card must hold the job and what the printer unpacks from it.
+            storage = storage_space.require_for_upload(name, printer, receipt)
             pa.drop(name, remote, "replaced by a new upload")
             warning = None
             try:
@@ -758,10 +761,11 @@ def _guarded_upload(name: str, printer, local_path: str, remote_path: str) -> di
                     raise pa.Refused("upload_failed",
                                      f"The upload of {remote} did not complete ({warning}). The card may hold a "
                                      "partial or old file, which is NOT admitted. Run upload_file again.")
-            admitted = pa.bind(name, remote, receipt)
+            admitted = pa.bind(name, remote, receipt, storage["card_id"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
-    out = {"success": True, "remote_path": remote, "contents": contents, "admission": admitted.public()}
+    out = {"success": True, "remote_path": remote, "contents": contents, "admission": admitted.public(),
+           "storage": storage}
     if warning:
         out["warning"] = (f"After the transfer bambu reported {warning}; the uploaded bytes were downloaded "
                           "again and match the prepared job, so it is admitted.")
@@ -795,6 +799,14 @@ def upload_file(
     transfer binds nothing. Arbitrary sliced files, edited jobs and jobs from a previous server
     run are refused; there is no override.
 
+    STORAGE: before a prepared job is transferred, the server lists the whole card and reads
+    its ``/bambu-mcp-card.json`` record (written by ``ops/attest_sd_card.py`` on a computer:
+    the printer reports neither capacity nor free space). Available = the recorded data area
+    minus every listed file and folder in whole clusters. It must cover the job, the largest
+    plate G-code the printer will unpack and a 64 MiB reserve; a file being replaced is not
+    credited. The printer must have reported a normal SD card on this connection. Otherwise
+    nothing is written. This server never deletes files to make room.
+
     Sibling disambiguation: ``upload_file`` copies a file from this host to the printer;
     ``download_file`` copies the other way, from the printer to this host.
     ``rename_sdcard_file`` moves a file that is already on the card without re-uploading it.
@@ -812,14 +824,22 @@ def upload_file(
     Returns:
         ``{"success": True, "remote_path": <normalized remote path>, "contents": <refreshed SD
         card tree>}`` on success, plus ``"admission": {"receipt_id", "part", "remote_path",
-        "sha256", "plates"}`` for a prepared job. ``contents`` is the printer library's SD card
+        "sha256", "plates", "target", "card_id"}`` and ``"storage": {"card_id", "attested_at",
+        "data_bytes", "cluster_bytes", "listed_allocated_bytes", "files", "folders",
+        "available_bytes", "listing_s", "firmware_reported_free_bytes", "required_bytes",
+        "required": {"job", "unpacked_gcode", "reserve"}, "sd_card": {"state", "source",
+        "age_s"}}`` for a prepared job. ``contents`` is the printer library's SD card
         listing taken after the upload; null when that listing failed. A prepared job whose
         post-transfer step failed is downloaded again and admitted only if its bytes match,
         with a ``"warning"``. Errors are ``{"error": str}`` (permission refusal, ``"Printer
         '<name>' not connected"``, ``"Error uploading file: <exception>"``) or ``{"error":
         code, "detail": str}`` with code ``job_not_prepared``, ``job_modified``,
-        ``remote_not_project``, ``invalid_remote_path``, ``upload_failed`` or
-        ``file_operation_busy``.
+        ``remote_not_project``, ``invalid_remote_path``, ``upload_failed``,
+        ``file_operation_busy`` or, with nothing written, ``storage_state_unknown``,
+        ``storage_no_card``, ``storage_card_abnormal``, ``storage_card_read_only``,
+        ``storage_unattested`` (no card record), ``storage_unknown`` (listing or record
+        unreadable) or ``storage_insufficient`` (with ``storage``: available, required and
+        their basis).
 
     Notes:
         A ``.3mf`` upload is parsed and cached by the printer library after the transfer, and
@@ -1400,6 +1420,11 @@ def print_file(
     as the printer reported it on the current connection. The start names the prepared plate
     type. Software cannot sense the plate or filament physically on the printer; that remains
     an observation for the camera or a person.
+    STORAGE: the printer unpacks the plate's G-code onto its SD card before printing (several
+    times the compressed job). After the card verification the server lists the card again and
+    requires room for that G-code plus a 64 MiB reserve, on the same card the job was uploaded
+    to (its ``/bambu-mcp-card.json`` record), with an SD state of normal reported on this
+    connection (docs/storage-space.md). A refusal keeps the admission (except on another card).
 
     Sibling disambiguation: ``print_file`` starts the print; ``preview_ams_mapping`` resolves
     the same ams_mapping without printing and is the read-only step before it.
@@ -1457,7 +1482,8 @@ def print_file(
         <bool>, "ams_mapping": <JSON string sent, empty when none>, "matches": <list of
         per-filament match dicts from the live-spool resolution, empty when ``ams_mapping``
         was provided or ``use_ams`` is False>, "admission": {"receipt_id", "part",
-        "remote_path", "sha256", "plates", "md5", "consumed": True}}``.
+        "remote_path", "sha256", "plates", "target", "card_id", "md5", "consumed": True},
+        "storage": <space evidence, as for upload_file>}``.
         Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
         ``user_permission`` is False, ``"Printer '<name>' not connected"``, the active-print
         block ``"Blocked: '<name>' is currently <state>. ..."``, or
@@ -1468,7 +1494,10 @@ def print_file(
         ``remote_verification_failed`` (FTPS error; the admission is kept), ``invalid_bed_type``,
         ``bed_type_mismatch``, ``printer_model_unknown``, ``printer_model_mismatch``,
         ``printer_not_qualified``, ``nozzle_unknown``, ``nozzle_mismatch``,
-        ``start_md5_unavailable``, ``invalid_ams_mapping``, ``print_metadata_unavailable``, ``filament_change_in_progress``, ``invalid_remote_path``
+        ``start_md5_unavailable``, ``storage_state_unknown``, ``storage_no_card``,
+        ``storage_card_abnormal``, ``storage_card_read_only``, ``storage_unattested``,
+        ``storage_unknown``, ``storage_insufficient`` (with ``storage``: available, required and
+        their basis), ``storage_card_changed`` (admission dropped), ``invalid_ams_mapping``, ``print_metadata_unavailable``, ``filament_change_in_progress``, ``invalid_remote_path``
         or ``file_operation_busy``. When the live-spool resolution fails, the return is the
         resolution payload of ``preview_ams_mapping`` (``file_path``, ``plate_num``,
         ``filaments``, ``resolved_ams_mapping``, ``ams_mapping_json``, ``matches``,
@@ -1547,6 +1576,7 @@ def _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mappi
     import json
     import shutil
     import print_admission as pa
+    import storage_space
     from bpm.bambuproject import cached_project_md5, get_project_info as _read_project
     from bpm.bambutools import PlateType
     from tools._guards import check_active_print_guard
@@ -1592,6 +1622,17 @@ def _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mappi
         raise pa.Refused("start_md5_unavailable",
                          f"bambu's metadata for {path} does not carry the verified MD5 {md5}, so the start packet "
                          "could not name the verified file. No command was sent; the admission is kept.")
+    # The printer unpacks the plate's G-code to the card before printing; free space may have
+    # changed since the upload. A refusal keeps the admission, except on another card.
+    try:
+        storage = storage_space.require_for_start(name, printer, admitted, plate_num)
+    except pa.Refused as r:
+        if r.code == "storage_card_changed":
+            pa.drop(name, path, "the SD card was replaced")
+            r.detail += " Its admission is dropped; upload the prepared job again."
+        else:
+            r.detail += " The admission is kept, so print_file may be called again."
+        raise
     matches: list[dict] = []
     # "" and [] are the empty forms clients send for "no mapping" (BPA's own URL
     # sends ams_mapping=); treat them as absent rather than as an empty mapping.
@@ -1624,6 +1665,7 @@ def _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mappi
     if getattr(tray, "name", str(tray)).upper() in ("LOADING", "UNLOADING"):
         return {"error": "filament_change_in_progress", "detail": "Finish the filament change before starting a print."}
     pa.check_printer(printer, admitted)  # again: the nozzle report may have changed during verification
+    storage_space.check_sd_state(printer)  # and the card may have been removed
     ticket = pa.StartTicket(path=path, plate=plate_num, use_ams=bool(use_ams), ams_mapping=ticket_mapping,
                             bed_type=bed_enum.name.lower(), bed_leveling=bool(bed_leveling),
                             flow=bool(flow_calibration), timelapse=bool(timelapse), md5=md5)
@@ -1659,6 +1701,7 @@ def _start_admitted(name, printer, path, plate_num, bed_type, use_ams, ams_mappi
         "ams_mapping": resolved_ams_mapping,
         "matches": matches,
         "admission": admission,
+        "storage": storage,
     }
 
 

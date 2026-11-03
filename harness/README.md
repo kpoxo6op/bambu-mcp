@@ -104,6 +104,15 @@ Replay a failure:
   The fixture renders, slices and checks no geometry: it only produces the outcomes
   a real preparer can, at the same process boundary. The real Soyrack renderer and
   slicer are tested in that repository.
+* SD card space (`docs/storage-space.md`). On 2026-11-03 an admitted 1.4 MB job was uploaded and
+  started on a card with 38 free clusters; the P1S could not unpack its 6.9 MB plate G-code (HMS
+  0500-4003). The fixture card carries an attestation record (1 GiB) and a listed-only dashcam file
+  sets its free space; the simulated printer reports the SD state in `sdcard` and `home_flag` as a
+  P1 does. A ~0.1 MB job whose G-code unpacks to 24 MiB is refused before any STOR where the job
+  alone would fit; uploaded with room, it is refused before the start once the card fills
+  (admission kept), then starts once with room, with exactly one `project_file` on the wire. No
+  card record, a read-only card, an SD state not reported since a reconnect and a card whose
+  record changed between upload and start (admission dropped) refuse before any write or start.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.
