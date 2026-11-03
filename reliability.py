@@ -985,7 +985,7 @@ class _Supervisor:
         old = manager.get_printer(name)
         if old is not None and not (getattr(old, "session_dead", None) and old.session_dead()):
             return  # never start a replacement while the old loop thread survives or is starting
-        delay = min(BACKOFF_MAX_S, BACKOFF_MIN_S * (2 ** e["failures"]))
+        delay = _bounded_backoff(BACKOFF_MIN_S, BACKOFF_MAX_S, e["failures"])
         e["failures"] += 1
         e["next_restart"] = now + delay
         log.warning("supervisor: restarting session for %s (%s); next attempt no sooner than %.0fs", name, reason, delay)
