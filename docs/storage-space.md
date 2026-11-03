@@ -31,9 +31,10 @@ logging is a monitoring change, and a second MQTT session is not allowed. The P1
 reports `sdcard: true` and `home_flag` bits 8-9 = 1. After deployment,
 `get_printer_connection_status` shows what the P1S sends under `telemetry.storage.sd_card`.
 
-A free figure the firmware takes from the FAT summary would have said about 29 GiB free on the
-2026-11-03 card. So a firmware free figure can only refuse (the lower of it and the measurement
-is used), never admit.
+The `tl_external_*` figures are not used for admission: they describe timelapse storage, nothing
+shows they are the card a job goes to, and a figure the firmware takes from the FAT summary would
+have said about 29 GiB free on the 2026-11-03 card. `get_printer_connection_status` shows one, if
+sent, as `telemetry.storage.timelapse_storage_free_bytes`.
 
 ## How space is measured
 
@@ -42,7 +43,11 @@ inserted, requires a clean `fsck.fat -n -v` (no wrong free-cluster summary, lost
 over-long chains). It takes the data area and cluster size from the filesystem, writes
 `/bambu-mcp-card.json` with a new random `card_id`, and requires fsck to be clean again. The
 server, on one FTPS session of its own printer session and only while the printer reports no
-job, lists the whole card and reads that record:
+job, lists the whole card with `LIST` and reads that record. The listing must be complete: a
+folder the printer refuses to list (550, which bpm's listing reads as empty), a row that is not a
+file or folder (a link, a device, a row that does not parse; bpm's listing skips those) or a folder
+nested deeper than 32 refuses with `storage_unknown`, because what it hides can be any size. An
+empty folder is fine.
 
 ```
 available = data_bytes - each listed file rounded up to whole clusters - folder clusters
@@ -50,11 +55,16 @@ upload    : job + largest plate G-code + 64 MiB reserve          (all rounded to
 start     : selected plate G-code + 64 MiB reserve, on the card whose card_id the upload bound
 ```
 
+A folder counts its entries as FAT stores them: 32 bytes for the short entry and 32 per 13
+UTF-16 units of the name (up to 21 entries, 672 bytes, for a 255-unit name), plus `.` and `..`,
+at least one cluster. `available` is an upper bound on the free space, not a guarantee.
+
 The listing does not depend on the FAT summary that was wrong. On the 2026-11-03 card the
 printer's FTPS listing (869 files, 29.1309 GiB) accounted for all but about 7 MB of the 954,778
 used clusters fsck counted; the unlisted part (17 lost clusters, two over-long chains) was under
-1 MiB. The 64 MiB reserve covers that kind of unlisted allocation, folder growth and firmware
-logs. A file being overwritten and an earlier unpacked copy in `/cache` are not credited.
+1 MiB. The 64 MiB reserve covers that kind of unlisted allocation (lost clusters, over-long chains,
+folder clusters still held by deleted entries: FAT folders never shrink), folder growth and
+firmware logs. A file being overwritten and an earlier unpacked copy in `/cache` are not credited.
 
 Applied to 2026-11-03: available = 954,816 x 32 KiB (31,287,410,688 bytes) minus the listed files
 (31,279,065,700 bytes before rounding) is at most 8.4 MB, against 1.4 MB + 6.9 MB + 64 MiB
@@ -70,14 +80,15 @@ All are `{"error": code, "detail", ...}` before anything is written or sent:
 | `storage_state_unknown` | no SD state reported on this MQTT connection (a value from before a reconnect does not count) |
 | `storage_no_card`, `storage_card_abnormal`, `storage_card_read_only` | the printer's reported state |
 | `storage_unattested` | no `/bambu-mcp-card.json` on the card, or not a valid record |
-| `storage_unknown` | the card or the record could not be read; try again |
-| `storage_insufficient` | `storage` carries `available_bytes`, `required_bytes`, `required` (job, unpacked_gcode, reserve), `data_bytes`, `listed_allocated_bytes`, `files`, `folders`, `firmware_reported_free_bytes`, `card_id`, `sd_card` |
+| `storage_unknown` | the record could not be read, or the listing is incomplete (`folder` names where: a folder the printer refused, a row that is not a file or folder) |
+| `storage_insufficient` | `storage` carries `available_bytes` (the figure the decision used), `required_bytes`, `required` (job, unpacked_gcode, reserve), `data_bytes`, `listed_allocated_bytes`, `files`, `folders`, `card_id`, `sd_card` |
+| `storage_record_protected` | `upload_file` to, or `rename_sdcard_file` onto, `/bambu-mcp-card.json` (any case, trailing dots, or its 8.3 alias): only the attestation script writes the record, so a caller cannot claim a size |
 | `storage_card_changed` | at the start, the card's record is not the one the upload bound; the admission is dropped |
 
 A start refused for space keeps its admission: free space on the card, then call `print_file`
 again. The server never deletes, formats or repairs anything to make room, and has no override.
 `get_printer_connection_status` shows `telemetry.storage`: the SD state reported on this
-connection, any firmware free figure and the latest space check with its age.
+connection, any timelapse-storage free figure (not used) and the latest space check with its age.
 
 ## Operator: attest a card
 
@@ -88,7 +99,10 @@ Do this after formatting a card, and for any card that is new to the printer:
 sudo python3 ops/attest_sd_card.py /dev/mmcblk0p1
 ```
 
-A card that fails fsck is reported and left alone; check or format it yourself, then attest. Re-attest
+A card that fails fsck is reported and left alone; check or format it yourself, then attest. If the card
+fails after the record was written (write, read-back or the second fsck), the script deletes the record
+again and says whether that worked, so a failed attestation never leaves a record the server accepts.
+The record is a file on the card; the server refuses to write it (`storage_record_protected`). Re-attest
 after reformatting. Moving files on the card from a computer is fine (the server lists the card each
 time); a corrupted card is not, so re-attest after an unclean removal or power loss during a write.
 
@@ -96,12 +110,16 @@ time); a corrupted card is not, so re-attest after an unclean removal or power l
 
 * The capacity is as good as the attestation; the card's identity is the record on it. A card copied
   file-for-file onto a different card carries the wrong capacity.
-* Allocation the listing cannot see beyond the reserve (heavy corruption since attestation, or folders
-  the printer refuses to list, which bpm reads as empty) is not detected.
+* Allocation the listing cannot see beyond the reserve (heavy corruption since attestation, many deleted
+  entries in a folder) is not detected.
+* The card's identity is not read (no CID or volume serial is visible over FTPS); a record copied onto
+  another card, or written onto the card from a computer by hand, is believed.
 * Between the measurement and the printer's unpacking, another client (Bambu Studio, Handy, a timelapse)
   can fill the card. The reserve absorbs some of it; the start is not watched afterwards.
 * Non-job files (`upload_file` of a `.txt`, etc.) are not space-checked.
 * FAT only (`fsck.fat`); exFAT cards cannot be attested by the script.
 * E2E (`harness/`) runs the printer's MQTT, FTPS and the server for real against a 1 GiB fixture card
   whose large files are listed but not stored. The attestation script was checked on FAT32 loop images
-  on platt: a clean image was attested; one with a wrong FSINFO free count was refused with nothing written.
+  on platt: a clean image was attested; one with a wrong FSINFO free count was refused with the image
+  unchanged; one made unclean between the write and the second fsck (a wrong FSINFO free count written
+  to the device) was refused and the record deleted (fsck -l lists no record afterwards).

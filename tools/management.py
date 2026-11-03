@@ -475,8 +475,9 @@ def get_printer_connection_status(name: str) -> dict:
         ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
         ``telemetry.storage`` (no I/O): ``sd_card`` is the SD card state the printer reported on
         this connection (``state`` absent, normal, abnormal, read_only or None when not yet
-        reported; ``source`` the MQTT field; ``age_s``), ``firmware_reported_free_bytes`` a
-        free-space figure only if the firmware sends one (a P1 does not), and
+        reported; ``source`` the MQTT field; ``age_s``), ``timelapse_storage_free_bytes`` the
+        firmware's timelapse-storage free figure if it sends one (a P1 does not; not used for
+        admission, since it need not be the SD card), and
         ``last_space_check`` the latest upload/start space measurement (``verdict`` ok or the
         refusal code, ``available_bytes``, ``required_bytes``, ``card_id``, ``checked_at``,
         ``age_s``) or None. Free space is measured only by ``upload_file`` and ``print_file``

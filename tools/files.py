@@ -735,6 +735,7 @@ def _guarded_upload(name: str, printer, local_path: str, remote_path: str) -> di
     import shutil
     import print_admission as pa
     import storage_space
+    storage_space.protect_record(pa.normalize_remote(remote_path))
     with pa.file_lock(name):
         if not (pa.is_job_name(local_path) or pa.is_job_name(remote_path)):
             # Not a printable job either way. It cannot become one later: rename refuses a
@@ -826,19 +827,21 @@ def upload_file(
         card tree>}`` on success, plus ``"admission": {"receipt_id", "part", "remote_path",
         "sha256", "plates", "target", "card_id"}`` and ``"storage": {"card_id", "attested_at",
         "data_bytes", "cluster_bytes", "listed_allocated_bytes", "files", "folders",
-        "available_bytes", "listing_s", "firmware_reported_free_bytes", "required_bytes",
+        "available_bytes", "listing_s", "required_bytes",
         "required": {"job", "unpacked_gcode", "reserve"}, "sd_card": {"state", "source",
         "age_s"}}`` for a prepared job. ``contents`` is the printer library's SD card
         listing taken after the upload; null when that listing failed. A prepared job whose
         post-transfer step failed is downloaded again and admitted only if its bytes match,
         with a ``"warning"``. Errors are ``{"error": str}`` (permission refusal, ``"Printer
         '<name>' not connected"``, ``"Error uploading file: <exception>"``) or ``{"error":
-        code, "detail": str}`` with code ``job_not_prepared``, ``job_modified``,
+        code, "detail": str}`` with code ``storage_record_protected`` (the SD card record
+        ``/bambu-mcp-card.json`` is written only by ``ops/attest_sd_card.py``),
+        ``job_not_prepared``, ``job_modified``,
         ``remote_not_project``, ``invalid_remote_path``, ``upload_failed``,
         ``file_operation_busy`` or, with nothing written, ``storage_state_unknown``,
         ``storage_no_card``, ``storage_card_abnormal``, ``storage_card_read_only``,
-        ``storage_unattested`` (no card record), ``storage_unknown`` (listing or record
-        unreadable) or ``storage_insufficient`` (with ``storage``: available, required and
+        ``storage_unattested`` (no card record), ``storage_unknown`` (record
+        unreadable, or a folder or listing row the card listing cannot account for) or ``storage_insufficient`` (with ``storage``: available, required and
         their basis).
 
     Notes:
@@ -2124,7 +2127,8 @@ def rename_sdcard_file(
         ``_permission_denied`` refusal when ``user_permission`` is False, ``"Printer '<name>'
         not connected"``, or ``"Error renaming file on '<name>': <exception>"``; or
         ``{"error": code, "detail": str}`` with code ``rename_creates_job`` (a non-printable
-        name renamed to a ``.3mf``/``.gcode`` name), ``invalid_remote_path`` or
+        name renamed to a ``.3mf``/``.gcode`` name), ``storage_record_protected`` (destination is
+        the SD card record), ``invalid_remote_path`` or
         ``file_operation_busy``.
 
     Notes:
@@ -2166,7 +2170,9 @@ def _guarded_rename(name: str, printer, src_path: str, dest_path: str):
     Shared with PATCH /api/rename_sdcard_file. Raises print_admission.Refused.
     """
     import print_admission as pa
+    import storage_space
     src, dest = pa.normalize_remote(src_path), pa.normalize_remote(dest_path)
+    storage_space.protect_record(dest)
     if pa.is_job_name(dest) and not pa.is_job_name(src):
         raise pa.Refused("rename_creates_job",
                          f"Renaming {src} to the printable name {dest} would create an unprepared job on the card. "

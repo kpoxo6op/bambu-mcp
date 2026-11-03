@@ -11,27 +11,32 @@ cluster summary claimed 945,077. Nothing in the server knew how full the card wa
 What the printer offers (docs/storage-space.md has the sources):
   MQTT   SD card state only: home_flag bits 8-9, aux bits 12-13, the legacy `sdcard` bool (none,
          normal, abnormal, read-only). Bambu Studio's only byte figures, device.cam
-         tl_external_free_kb / tl_external_total_kb, are timelapse storage on newer models; a P1
-         sends no such field, and a figure the firmware takes from the FAT summary can be the
-         stale 945,077-cluster kind. Such a figure can only refuse, never admit.
+         tl_external_free_kb / tl_external_total_kb, are timelapse storage on newer models with
+         built-in storage; a P1 sends no such field, and nothing shows the figure is the card a job
+         goes to, so it is shown in telemetry and not used here.
   FTPS   names and sizes (LIST). No free-space or capacity command is documented for the
          printer's FTPS dialect, so none is sent.
 
 So the card's capacity comes from the card itself: ops/attest_sd_card.py, run on a computer with
 the card inserted, requires a clean `fsck.fat -n`, reads the data-area size and cluster size from
 the filesystem and writes /bambu-mcp-card.json with a random card id. The server reads that file
-and lists the whole card (both over FTPS, only while the printer reports no job), then:
+and lists the whole card (both over FTPS, only while the printer reports no job). The listing
+must be complete: a folder the printer refuses to list (550) or a listing row that is not a
+recognised file or folder refuses, because what it hides can be any size. Then:
 
   available = data bytes - every listed file rounded up to whole clusters - folder clusters
   upload    needs the job (rounded) + its largest plate G-code (rounded) + RESERVE_BYTES
   start     needs the selected plate G-code (rounded) + RESERVE_BYTES (the job is on the card)
 
-A file being overwritten and an earlier unpacked copy in /cache are not credited. RESERVE_BYTES
-covers what a listing cannot show (clusters lost to corruption; the 2026-11-03 card had 17 lost
-clusters and two over-long chains, under 1 MiB together), folder growth and firmware logs.
+A file being overwritten and an earlier unpacked copy in /cache are not credited. available is an
+upper bound on the free space, not a guarantee: RESERVE_BYTES covers what a listing cannot show
+(clusters lost to corruption since the attestation; the 2026-11-03 card had 17 lost clusters and
+two over-long chains, under 1 MiB together; folder clusters still held by deleted entries), folder
+growth and firmware logs.
 
-Unknown is refused: no card marker, a marker that does not parse, a failed listing, an SD state
-not reported on this connection, or a state other than normal. Nothing here deletes, formats or
+Unknown is refused: no card marker, a marker that does not parse, a folder that cannot be listed,
+a listing row that is not a file or folder, an SD state not reported on this connection, or a
+state other than normal. Nothing here deletes, formats or
 writes the card, and there is no override.
 """
 
@@ -110,10 +115,23 @@ def check_sd_state(printer) -> dict:
     raise pa.Refused(code, f"{text}. Nothing was written to the card and no command was sent.", sd_card=sd)
 
 
+# The record's own name and the 8.3 alias FAT gives it (BAMBU-~1.JSO); FAT ignores case and
+# trailing dots and spaces.
+_RECORD_NAMES = re.compile(r"/(bambu-mcp-card\.json|bambu\S*~\d+\.jso)", re.I)
+
+
+def protect_record(remote: str) -> None:
+    """Refuse a server write onto the card record: the record is the card's capacity, so only
+    ops/attest_sd_card.py writes it, on a computer, after fsck. A caller's upload would be a claim."""
+    if _RECORD_NAMES.fullmatch(remote.rstrip(" ./")):
+        raise pa.Refused("storage_record_protected",
+                         f"{remote} is the SD card's record, which states the card's size; this server does not "
+                         f"write it. Nothing was written. {_ATTEST}")
+
+
 def _read_marker(ftps, tree: dict) -> dict:
     """The card record named in the listing, read on the same FTPS session and validated."""
-    entry = next((c for c in tree.get("children") or [] if "children" not in c
-                  and str(c.get("name", "")).casefold() == MARKER[1:]), None)
+    entry = next((c for c in tree["children"] if "children" not in c and c["name"].casefold() == MARKER[1:]), None)
     if entry is None:
         raise pa.Refused("storage_unattested",
                          f"The SD card has no {MARKER}, so its size is unknown: the printer reports neither capacity nor "
@@ -125,7 +143,7 @@ def _read_marker(ftps, tree: dict) -> dict:
     local = os.path.join(tmpdir, "card.json")
     try:
         try:
-            ftps.download_file(entry.get("id") or MARKER, local)
+            ftps.download_file("/" + entry["name"], local)
         except Exception as exc:
             raise pa.Refused("storage_unknown", f"{MARKER} could not be read from the card ({type(exc).__name__}: "
                              f"{exc}). Nothing was written and no command was sent.") from None
@@ -148,22 +166,78 @@ def _read_marker(ftps, tree: dict) -> dict:
     return card
 
 
+# One row of the printer's LIST: a file or folder, ls -l style. Anything else (a link, a device,
+# a row this does not parse) refuses rather than being skipped.
+_ROW = re.compile(r"(?P<type>[d-])[rwxsStT-]{9}\s+\d+\s+\S+\s+\S+\s+(?P<size>\d+)\s+"
+                  r"(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+(?:\d{4}|\d{1,2}:\d{2})\s+(?P<name>.+)")
+_MONTHS = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+_TOTAL = re.compile(r"total \d+")  # an ls -l header line; it names no entry
+MAX_DEPTH = 32
+
+
+def _unlisted(path: str, why: str) -> pa.Refused:
+    return pa.Refused("storage_unknown", f"The SD card's listing is incomplete: {path} {why}, so what it holds and "
+                      "the card's free space are unknown. Nothing was written and no command was sent.", folder=path)
+
+
+def _list_card(ftps) -> dict:
+    """The whole card as {"name", "children": [...]}, read with LIST on the FTPS session ftps
+    already holds. Every folder must list and every row must be a file or a folder: a refused
+    folder (bpm reads a 550 as empty) or a skipped row could hide any amount of used space."""
+    session = ftps.ftps_session
+    root = {"name": "/", "children": []}
+    stack = [("/", root, 0)]
+    while stack:
+        path, node, depth = stack.pop()
+        if depth > MAX_DEPTH:
+            raise _unlisted(path, f"is nested deeper than {MAX_DEPTH} folders")
+        rows: list[str] = []
+        try:
+            session.retrlines(f"LIST {path}", rows.append)
+        except Exception as exc:
+            raise _unlisted(path, f"could not be listed ({type(exc).__name__}: {str(exc).strip()})") from None
+        for i, row in enumerate(rows):
+            if not row.strip() or (i == 0 and _TOTAL.fullmatch(row.strip())):
+                continue
+            m = _ROW.fullmatch(row)
+            if not m or m["month"] not in _MONTHS or not 1 <= int(m["day"]) <= 31:
+                raise _unlisted(path, f"lists an entry that is not a file or folder: {row[:120]!r}")
+            name = m["name"]
+            if name in (".", "..") or "/" in name:
+                raise _unlisted(path, f"lists an entry this cannot place: {row[:120]!r}")
+            child = {"name": name}
+            if m["type"] == "d":
+                child["children"] = []
+                stack.append((f"{path.rstrip('/')}/{name}", child, depth + 1))
+            else:
+                child["size"] = int(m["size"])
+            node["children"].append(child)
+    return root
+
+
+def _entry_bytes(name: str) -> int:
+    """Directory bytes FAT uses for name: one 32-byte short entry and one long-name entry per 13
+    UTF-16 units (up to 20 for a 255-unit name), counted even when the name would fit 8.3."""
+    return 32 * (1 + -(-len(name.encode("utf-16-le")) // 26))
+
+
 def _usage(tree: dict, cluster: int) -> tuple[int, int, int]:
-    """(allocated bytes, files, folders) for a bpm SD card tree, the root folder included."""
+    """(allocated bytes, files, folders) for a listed card tree, the root folder included. A
+    folder counts its entries' actual name lengths plus its "." and ".." entries, at least one
+    cluster; slots held by deleted entries are not visible here and fall to the reserve."""
     allocated = files = folders = 0
     stack = [tree]
     while stack:
         node = stack.pop()
-        children = node.get("children") or []
+        children = node["children"]
         folders += 1
-        # A FAT folder is at least one cluster; long names take up to 4 entries of 32 bytes.
-        allocated += _clusters(max(1, len(children) + 2) * 128, cluster)
+        allocated += _clusters(max(1, 64 + sum(_entry_bytes(c["name"]) for c in children)), cluster)
         for child in children:
             if "children" in child:
                 stack.append(child)
             else:
                 files += 1
-                allocated += _clusters(child.get("size") or 0, cluster)
+                allocated += _clusters(child["size"], cluster)
     return allocated, files, folders
 
 
@@ -173,27 +247,19 @@ def measure(printer) -> dict:
     started = time.monotonic()
     try:
         with printer.ftp_connection() as ftps:
-            tree = printer._get_sftp_files(ftps, "/")  # bpm's listing: None on any failed folder
+            tree = _list_card(ftps)
             listing_s = round(time.monotonic() - started, 2)
-            card = _read_marker(ftps, tree) if isinstance(tree, dict) else None
+            card = _read_marker(ftps, tree)
     except pa.Refused:
         raise
     except Exception as exc:
         raise pa.Refused("storage_unknown", f"The SD card could not be read ({type(exc).__name__}: {exc}), so its "
                          "free space is unknown. Nothing was written and no command was sent.") from None
-    if card is None:
-        raise pa.Refused("storage_unknown", "The SD card could not be listed, so its free space is unknown. Nothing "
-                         "was written and no command was sent; try again.")
     cluster = card["cluster_bytes"]
     used, files, folders = _usage(tree, cluster)
     return {"card_id": card["card_id"], "attested_at": card.get("attested_at"), "data_bytes": card["data_bytes"],
             "cluster_bytes": cluster, "listed_allocated_bytes": used, "files": files, "folders": folders,
             "available_bytes": card["data_bytes"] - used, "listing_s": listing_s}
-
-
-def _firmware_free(printer) -> int | None:
-    reported = getattr(printer, "reported_external_free_bytes", None)
-    return reported() if callable(reported) else None
 
 
 def require(name: str, printer, purpose: str, needs, card_id: str | None = None) -> dict:
@@ -210,10 +276,8 @@ def require(name: str, printer, purpose: str, needs, card_id: str | None = None)
         raise
     breakdown = {**needs(evidence["cluster_bytes"]), "reserve": RESERVE_BYTES}
     required = sum(breakdown.values())
-    firmware = _firmware_free(printer)
-    available = evidence["available_bytes"] if firmware is None else min(evidence["available_bytes"], firmware)
-    evidence = {**evidence, "firmware_reported_free_bytes": firmware, "required_bytes": required,
-                "required": breakdown, "sd_card": sd}
+    available = evidence["available_bytes"]
+    evidence = {**evidence, "required_bytes": required, "required": breakdown, "sd_card": sd}
     if card_id is not None and evidence["card_id"] != card_id:
         _record(name, {"purpose": purpose, "verdict": "storage_card_changed", **evidence})
         raise pa.Refused("storage_card_changed", "The SD card is not the one the job was uploaded to (its card record "
@@ -223,8 +287,6 @@ def require(name: str, printer, purpose: str, needs, card_id: str | None = None)
         parts = ", ".join(f"{k} {_mib(v)}" for k, v in breakdown.items())
         source = (f"attested data area {_mib(evidence['data_bytes'])} minus {_mib(evidence['listed_allocated_bytes'])} "
                   f"in {evidence['files']} listed files and {evidence['folders']} folders, measured just now")
-        if firmware is not None and firmware < evidence["available_bytes"]:
-            source = f"the printer reports {_mib(firmware)} free; {source}"
         raise pa.Refused("storage_insufficient",
                          f"The SD card has {_mib(available)} available ({source}) but the {purpose} needs "
                          f"{_mib(required)} ({parts}). Nothing was written and no command was sent. Free space on "

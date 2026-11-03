@@ -113,6 +113,11 @@ Replay a failure:
   (admission kept), then starts once with room, with exactly one `project_file` on the wire. No
   card record, a read-only card, an SD state not reported since a reconnect and a card whose
   record changed between upload and start (admission dropped) refuse before any write or start.
+  The listing must be complete: a folder's files count (one dated `Nov  3`, a form bpm's listing
+  skips), an empty folder is fine, and a folder answering LIST with 550, a link row and an unparsed
+  row each refuse the upload and the start (`storage_unknown`) with no STOR or `project_file`. A
+  caller cannot write the card record: uploads to its name (any case, a trailing dot, the 8.3
+  alias) and a rename onto it are refused with nothing sent.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.

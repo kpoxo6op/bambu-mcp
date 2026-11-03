@@ -85,6 +85,9 @@ class FTPSPeer(Listener):
                       CARD_RECORD:card_record()}
         # Listed size of files whose bytes nobody reads here (a dashcam's videos filling the card).
         self.sizes = {}
+        # Folders below the root: path -> LIST rows, or None for a folder the printer refuses (550).
+        self.folders = {}
+        self.root_rows = []  # extra raw rows in the root listing (folders, rows bpm skips)
         super().__init__(ctx, 990)
 
     def serve(self, raw):
@@ -122,9 +125,14 @@ class FTPSPeer(Listener):
                         if verb=="PASV": reply(f"227 Entering Passive Mode (127,0,0,1,{port//256},{port%256})")
                         else: reply(f"229 Entering Extended Passive Mode (|||{port}|)")
                     elif verb in ("LIST","RETR"):
-                        if verb=="LIST":
-                            data="".join(f"-rw-r--r-- 1 test test {self.sizes.get(n, len(v))} Jan 01 2026 {n}\r\n"
-                                         for n,v in self.files.items()).encode()
+                        if verb=="LIST" and arg.strip("/") in self.folders:
+                            rows=self.folders[arg.strip("/")]
+                            if rows is None:
+                                reply("550 Permission denied"); continue
+                            data="".join(f"{r}\r\n" for r in rows).encode()
+                        elif verb=="LIST":
+                            data="".join([f"-rw-r--r-- 1 test test {self.sizes.get(n, len(v))} Jan 01 2026 {n}\r\n"
+                                          for n,v in self.files.items()]+[f"{r}\r\n" for r in self.root_rows]).encode()
                         else:
                             name=arg.lstrip("/")
                             if name not in self.files:

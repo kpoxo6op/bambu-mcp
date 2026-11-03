@@ -1007,6 +1007,52 @@ async def campaign(seed, cycles):
                     assert len(broker.mutations()) == before, broker.mutations()[before:]
                     events.append({"contract":"unattested card, read-only card and a replaced card refuse before "
                                    "any write or start", "sent":0})
+                    # The listing must be complete: bpm reads a folder the printer refuses (550) as empty and
+                    # skips rows it does not parse, and either can hide any amount of used space. A folder's
+                    # files count (here dated "Nov  3", a form bpm skips); an empty folder is fine; a refused
+                    # folder, a link and an unparsed row refuse the upload and the start before STOR or project_file.
+                    ftps.root_rows = ["drwxr-xr-x 1 test test 0 Jan 01 2026 timelapse"]
+                    ftps.folders["timelapse"] = []
+                    up = await upload(prep["job_path"], "/opaque.gcode.3mf")
+                    assert up.get("admission") and up["storage"]["folders"] == 2, up
+                    before, stores = len(broker.mutations()), len(ftps.stores)
+                    ftps.folders["timelapse"] = [f"-rw-r--r-- 1 test test {150 * MiB} Nov  3 18:19 video.mp4"]
+                    refused = await upload(prep["job_path"], "/opaque.gcode.3mf")
+                    assert refused.get("error") == "storage_insufficient", refused
+                    assert refused["storage"]["available_bytes"] <= up["storage"]["available_bytes"] - 150 * MiB, refused
+                    assert refused["storage"]["available_bytes"] < refused["storage"]["required_bytes"], refused
+                    for case, rows in (("refused folder", None), ("link", []), ("unparsed row", [])):
+                        ftps.folders["timelapse"] = rows
+                        ftps.root_rows = ["drwxr-xr-x 1 test test 0 Jan 01 2026 timelapse",
+                                          *{"link": ["lrwxrwxrwx 1 test test 9 Jan 01 2026 video -> /x"],
+                                            "unparsed row": ["-rw-r--r-- 1 test test Jan 01 2026 video.mp4"]}.get(case, [])]
+                        refused = await upload(prep["job_path"], "/opaque.gcode.3mf")
+                        assert refused.get("error") == "storage_unknown" and "incomplete" in refused["detail"], (case, refused)
+                        refused = await start("/opaque.gcode.3mf")
+                        assert refused.get("error") == "storage_unknown" and "admission is kept" in refused["detail"], (case, refused)
+                    assert refused["folder"] == "/", refused
+                    ftps.root_rows, ftps.folders["timelapse"] = ftps.root_rows[:1], None
+                    refused = await upload(prep["job_path"], "/opaque.gcode.3mf")
+                    assert refused.get("folder") == "/timelapse" and "550" in refused["detail"], refused
+                    assert len(ftps.stores) == stores and len(broker.mutations()) == before, ftps.stores[stores:]
+                    ftps.root_rows, ftps.folders = [], {}
+                    assert (await upload(prep["job_path"], "/opaque.gcode.3mf")).get("admission")
+                    events.append({"contract":"a folder's files count; a folder the printer refuses, a link or an "
+                                   "unparsed listing row refuses the upload and the start", "sent":0})
+                    # The card record states the card's size, so a caller cannot write one: not by upload
+                    # (any spelling, or FAT's 8.3 alias) and not by renaming another file onto it.
+                    forged = tmp / "card.json"
+                    forged.write_bytes(card_record(card_id="2" * 32, data_bytes=1 << 40))
+                    stores, renames = len(ftps.stores), sum(1 for verb, _ in ftps.commands if verb == "RNFR")
+                    for remote in ("/bambu-mcp-card.json", "/BAMBU-MCP-CARD.JSON.", "/BAMBU-~1.JSO"):
+                        refused = await upload(forged, remote)
+                        assert refused.get("error") == "storage_record_protected", (remote, refused)
+                    refused = await call("rename_sdcard_file", user_permission=True, src_path="/notes.txt",
+                                         dest_path="/Bambu-MCP-Card.json")
+                    assert refused.get("error") == "storage_record_protected", refused
+                    assert len(ftps.stores) == stores and ftps.files[CARD_RECORD] == card_record(), ftps.stores[stores:]
+                    assert sum(1 for verb, _ in ftps.commands if verb == "RNFR") == renames
+                    events.append({"contract":"the card record cannot be uploaded or renamed onto by a caller", "sent":0})
                     # The admitted path: plate and options are checked before the admission is used, the
                     # card is re-read before the start, and exactly one bound start reaches the wire.
                     before, stores = len(broker.mutations()), len(ftps.stores)

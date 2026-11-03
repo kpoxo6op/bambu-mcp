@@ -1127,7 +1127,7 @@ def health(name: str) -> dict:
     try:
         import storage_space
         base["storage"] = {"sd_card": storage_space.sd_state(p),
-                           "firmware_reported_free_bytes": p.reported_external_free_bytes(),
+                           "timelapse_storage_free_bytes": p.reported_external_free_bytes(),
                            "last_space_check": storage_space.last_check(name)}
     except Exception as exc:
         base["storage"] = {"error": f"{type(exc).__name__}: {exc}"}
