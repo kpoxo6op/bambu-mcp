@@ -40,6 +40,15 @@ Replay a failure:
   are then refused, as when the P1S dropped off Wi-Fi on 2026-11-02. Telemetry
   must go not-live, writes are refused, the dead socket is released, the MCP
   stays healthy and the session returns by itself when the printer does.
+* The printer answers requests but sends no status report, as the live P1S did on
+  2026-11-03 while printing from SD: get_version answered, one partial report, every
+  full-state request ignored. The old supervisor dropped such a connection 120 s after each
+  connect (paho logs our own disconnect() as "Normal disconnection") and health said
+  "starting". Now health must say stale and that the printer answers, writes are refused,
+  full-state requests back off (with a request to start streaming reports), the connection is
+  replaced once at the widening threshold and not again within the doubled interval, and
+  the late report makes it live on the existing connection. A refused report subscription
+  (SUBACK 0x80) is named in health and the connection is replaced until one is granted.
 * Client-side MQTT sockets are counted from `/proc/net/tcp` in the namespace at
   every accepted connection and after every fault. More than one ESTABLISHED or
   CLOSE_WAIT socket fails the run; CLOSE_WAIT is the 2026-11-01 leak.

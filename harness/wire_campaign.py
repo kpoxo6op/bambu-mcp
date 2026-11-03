@@ -100,6 +100,12 @@ class Broker:
         self.refusals = 0
         # Peers whose link went dead: never read from or written to again, no PINGRESP.
         self.blackholed = set()
+        # A printer that answers requests (get_version replies) while it sends no status report
+        # and ignores full-state requests: the live P1S on 2026-11-03.
+        self.answering = False
+        # SUBACK failure (0x80) for the report topic; such a peer is sent nothing on that topic.
+        self.refuse_subscribe = False
+        self.unsubscribed = set()
         self.held_max = 0
         self.stop = threading.Event()
         threading.Thread(target=self.accept, daemon=True).start()
@@ -131,7 +137,7 @@ class Broker:
         self.send(peer, packet(0x30, len(topic).to_bytes(2, "big")+topic+body))
 
     def broadcast(self, data=None):
-        for peer in list(self.peers):
+        for peer in list(self.peers - self.unsubscribed):
             try:
                 self.report(peer, data)
             except OSError:
@@ -192,6 +198,11 @@ class Broker:
                 if typ == 1:
                     self.send(peer, b"\x20\x02\x00\x00")
                 elif typ == 8:
+                    if self.refuse_subscribe:
+                        self.unsubscribed.add(peer)
+                        self.send(peer, packet(0x90, body[:2]+b"\x80"))
+                        continue
+                    self.unsubscribed.discard(peer)
                     self.send(peer, packet(0x90, body[:2]+b"\x00"))
                     if self.reports:
                         self.report(peer)
@@ -199,8 +210,13 @@ class Broker:
                     size = int.from_bytes(body[:2], "big")
                     msg = json.loads(body[2+size:])
                     self.received.append(msg)
+                    if peer in self.unsubscribed:
+                        continue
                     if self.reports and msg.get("pushing", {}).get("command") == "pushall":
                         self.report(peer)
+                    elif self.answering and msg.get("info", {}).get("command") == "get_version":
+                        self.report(peer, {"info": {"command": "get_version", "sequence_id": "0", "module": [
+                            {"name": "ota", "sw_ver": "01.09.00.00", "product_name": "P1S"}]}})
                 elif typ == 12:
                     self.send(peer, b"\xd0\x00")
                 elif typ == 14:
@@ -211,14 +227,18 @@ class Broker:
             if peer:
                 self.peers.discard(peer)
                 self.blackholed.discard(peer)
+                self.unsubscribed.discard(peer)
                 peer.close()
             else:
                 raw.close()
 
     def mutations(self):
         return [m for m in self.received if not (
-            m.get("pushing", {}).get("command") == "pushall" or
+            m.get("pushing", {}).get("command") in ("pushall", "start") or
             m.get("info", {}).get("command") == "get_version")]
+
+    def full_state_requests(self):
+        return sum(1 for m in self.received if m.get("pushing", {}).get("command") == "pushall")
 
     def drop(self):
         for peer in list(self.peers):
@@ -447,6 +467,83 @@ async def campaign(seed, cycles):
                     assert len(broker.mutations()) == before and broker.maximum == 1, broker.mutations()
                     events.append({"fault":"unusable-frame-flood","recovery_s":round(time.monotonic()-start,3),
                                    "replayed":0})
+                    # 2026-11-03, live P1S printing from SD: MQTT stayed connected and the printer answered
+                    # get_version and pings, but sent one partial report and then nothing, ignoring every
+                    # full-state request. The supervisor dropped the connection 120 s after each connect
+                    # (paho names our own disconnect() "Normal disconnection"), 39 times without effect,
+                    # and health said "starting" throughout. A printer that answers is not a dead link:
+                    # state stays unknown and writes refused, health says why, full-state requests back
+                    # off, the connection is replaced only on a widening schedule, and a late report is
+                    # used on the same connection.
+                    before = len(broker.mutations())
+                    broker.reports = False
+                    broker.answering = True
+                    broker.drop()
+                    for _ in range(60):
+                        if broker.peers:
+                            break
+                        await asyncio.sleep(.05)
+                    assert broker.peers, "paho never reconnected after the drop"
+                    connections, requests, start = broker.connections, broker.full_state_requests(), time.monotonic()
+                    restarts = (await call("get_printer_connection_status"))["telemetry"]["restarts"]
+                    broker.broadcast({"print": {"command": "push_status", "mc_remaining_time": 210,
+                                                "wifi_signal": "-61dBm", "sequence_id": "1"}})
+                    while time.monotonic() - start < 4.:
+                        assert broker.connections == connections, (
+                            f"connection replaced {time.monotonic()-start:.1f}s after connect although the "
+                            "printer answered requests", broker.connections - connections)
+                        await asyncio.sleep(.1)
+                    quiet = (await call("get_printer_connection_status"))["telemetry"]
+                    assert quiet["status"] == "stale" and not quiet["live"] and not quiet["writable"], quiet
+                    assert "no full status report" in quiet["reason"] and "answers" in quiet["reason"], quiet
+                    assert quiet["full_state"]["unanswered"] >= 2, quiet
+                    state = await call("get_print_progress")
+                    assert state.get("error") == "telemetry_not_live", state
+                    await refuses_writes()
+                    sent = broker.full_state_requests() - requests
+                    assert 2 <= sent <= 5, f"{sent} full-state requests in 4s to a printer that ignores them"
+                    assert any(m.get("pushing", {}).get("command") == "start" for m in broker.received), \
+                        "report streaming was never requested"
+                    # One replacement on the widening schedule, then none for a while.
+                    while broker.connections == connections and time.monotonic() - start < 9.:
+                        await asyncio.sleep(.1)
+                    replaced = time.monotonic() - start
+                    assert broker.connections == connections + 1 and replaced >= 4.5, (replaced, broker.connections)
+                    await asyncio.sleep(3.)
+                    assert broker.connections == connections + 1, "replacement connections did not widen"
+                    again = (await call("get_printer_connection_status"))["telemetry"]
+                    assert again["restarts"] == restarts + 1 and not again["writable"], again
+                    # The next replacement reaches the configured cap (7s), rather than doubling
+                    # indefinitely. The existing first-replacement check does not own saturation.
+                    second_start = time.monotonic()
+                    while broker.connections == connections + 1 and time.monotonic() - start < 16.:
+                        await asyncio.sleep(.1)
+                    second_at = time.monotonic() - start
+                    assert broker.connections == connections + 2 and 11. <= second_at <= 14.5, (second_at, broker.connections)
+                    connections += 1  # recovery below must keep this second replacement connection
+                    # The printer reports again: the backed-off full-state request is answered on the
+                    # connection that exists, with no further reconnect.
+                    broker.reports = True
+                    await until_live()
+                    assert broker.connections == connections + 1 and broker.maximum == 1, broker.connections
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"fault":"answering-printer-without-reports","replaced_after_s":round(replaced,1),
+                                   "full_state_requests_4s":sent,"recovery_s":round(time.monotonic()-start,3),
+                                   "replayed":0})
+                    # The printer refuses the report subscription (SUBACK 0x80): nothing can arrive, so
+                    # health names it and the connection is replaced until a subscription is granted.
+                    connections = broker.connections
+                    broker.refuse_subscribe = True
+                    broker.drop()
+                    refused = await health_until(lambda h: "subscription" in str(h.get("reason")),
+                                                 "refused report subscription not reported", timeout=5)
+                    assert not refused["live"] and not refused["writable"], refused
+                    broker.refuse_subscribe = False
+                    await until_live()
+                    assert broker.connections >= connections + 2 and broker.maximum == 1, broker.connections
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    broker.answering = False
+                    events.append({"fault":"report-subscription-refused","replayed":0})
                     # The link dies silently (no FIN/RST, no data, no PINGRESP) and the printer then
                     # stays unreachable: what the live P1S did on 2026-11-02. Telemetry must go
                     # not-live, writes are refused, the dead socket is released rather than left
