@@ -873,6 +873,58 @@ def upload_file(
         return {"error": f"Error uploading file: {e}"}
 
 
+def register_sd_card(name: str, registration_id: str, user_permission: bool = False) -> dict:
+    """
+    Record the size of the SD card in the printer on the card, from an operator registration.
+
+    WHEN to use: only as the last step of ``ops/register_sd_card.py``, which an operator runs on
+    this host with saved ``fsck.fat -n`` output of this card (checked on a computer) and a
+    custody statement, and which calls this tool itself with the id it prints. This tool takes
+    no size: the size comes from the fsck output in the registration, parsed again here. A card
+    in a computer is recorded with ``ops/attest_sd_card.py`` instead (docs/storage-space.md).
+
+    WRITE GUARD: writes ``/bambu-mcp-card.json`` (about 1 KB) to the printer's SD card
+    over this server's own FTPS session, only while the printer reports no job, only when the
+    card has no record yet. With ``user_permission`` False nothing is read or written.
+
+    Sibling disambiguation: ``upload_file`` and ``rename_sdcard_file`` refuse the record's name
+    (``storage_record_protected``); this is the only tool that writes it.
+
+    Args:
+        name: Configured printer name (see ``get_configured_printers``).
+        registration_id: The 32-hex id ``ops/register_sd_card.py`` printed. Each registration is
+            used once, by the first call naming it, and expires 15 minutes after it was made.
+        user_permission: Must be True to execute. Default False.
+
+    Returns:
+        ``{"registered": True, "registration_id", "device", "fsck_used_clusters", "sd_card",
+        "storage": {"card_id", "attested_at", "basis", "data_bytes", "cluster_bytes",
+        "listed_allocated_bytes", "files", "folders", "available_bytes", "listing_s"}}``: the card
+        as uploads and starts will now read it. Errors are ``{"error": code, "detail": str}`` with
+        nothing written for ``registration_invalid``, ``registration_missing`` (none pending with
+        that id: never made, already used), ``registration_store_untrusted``,
+        ``storage_already_attested``, ``registration_inconsistent`` (the card lists more than the
+        registered data area), ``storage_state_unknown``, ``storage_no_card``,
+        ``storage_card_abnormal``, ``storage_card_read_only``, ``storage_unknown`` (card unreadable,
+        listing incomplete, or the printer reports a job) and ``file_operation_busy``;
+        ``registration_failed`` when the write, its read-back or the measurement after it failed (detail says what the card
+        may hold); the ``_permission_denied`` refusal; ``"Printer '<name>' not connected"``.
+    """
+    log.debug("register_sd_card: called for name=%s registration_id=%s user_permission=%s", name, registration_id, user_permission)
+    if not user_permission:
+        return {"error": _permission_denied("This would write the SD card record /bambu-mcp-card.json to the card.")}
+    printer = session_manager.get_printer(name)
+    if printer is None:
+        return _no_printer(name)
+    import print_admission
+    import storage_space
+    try:
+        return storage_space.register(name, printer, registration_id)
+    except print_admission.Refused as r:
+        log.warning("register_sd_card: %s refused: %s", name, r)
+        return r.as_dict()
+
+
 def download_file(
     name: str,
     remote_path: str,
@@ -902,8 +954,9 @@ def download_file(
         name: Configured printer name (see ``get_configured_printers``).
         remote_path: Full path of the file on the printer's SD card.
         local_path: Destination path on this host. Paths inside the server's prepared-job
-            store (``~/.bambu-mcp/preflight/``) are refused, so a download can never replace
-            a prepared job or its report.
+            store (``~/.bambu-mcp/preflight/``) and SD card registration store
+            (``~/.bambu-mcp/sd-card/``) are refused, so a download can never replace a prepared
+            job, its report or an operator's card registration.
         user_permission: Must be True to execute. Default False.
 
     Returns:
@@ -911,7 +964,7 @@ def download_file(
         success. Errors are ``{"error": str}``: the ``_permission_denied`` refusal when
         ``user_permission`` is False, ``"Printer '<name>' not connected"``, or
         ``"Error downloading file: <exception>"``; or ``{"error": "local_path_reserved",
-        "detail": str}`` for a destination inside the prepared-job store.
+        "detail": str}`` for a destination inside either store.
     """
     log.debug("download_file: called for name=%s remote_path=%s local_path=%s user_permission=%s", name, remote_path, local_path, user_permission)
     if not user_permission:
@@ -920,10 +973,11 @@ def download_file(
             "This would write the SD card file to the local path on this host, overwriting any file already there."
         )}
     import print_admission
-    if print_admission.inside_store(local_path):
+    import storage_space
+    if print_admission.inside_store(local_path) or print_admission.inside_store(local_path, storage_space.registry_root()):
         return {"error": "local_path_reserved",
-                "detail": f"{local_path} is inside the server's prepared-job store; choose another destination. "
-                          "Nothing was downloaded."}
+                "detail": f"{local_path} is inside the server's prepared-job or SD card registration store; choose "
+                          "another destination. Nothing was downloaded."}
     printer = session_manager.get_printer(name)
     if printer is None:
         log.warning("download_file: printer not connected: %s", name)

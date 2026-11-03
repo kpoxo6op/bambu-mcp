@@ -109,11 +109,11 @@ def _ensure_root() -> Path:
     return Path(os.path.realpath(root))
 
 
-def inside_store(local_path: str) -> bool:
-    """True when local_path (existing or not) resolves inside the preparer output root."""
+def inside_store(local_path: str, root: Path | None = None) -> bool:
+    """True when local_path (existing or not) resolves inside root (default: the preparer output root)."""
     try:
         target = Path(os.path.realpath(os.path.expanduser(str(local_path))))
-        root = Path(os.path.realpath(output_root()))
+        root = Path(os.path.realpath(output_root() if root is None else root))
     except (OSError, ValueError):
         return True
     return target == root or root in target.parents

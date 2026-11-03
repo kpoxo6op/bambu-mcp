@@ -38,11 +38,16 @@ sent, as `telemetry.storage.timelapse_storage_free_bytes`.
 
 ## How space is measured
 
-The capacity comes from the card. `ops/attest_sd_card.py`, run on a computer with the card
-inserted, requires a clean `fsck.fat -n -v` (no wrong free-cluster summary, lost clusters or
-over-long chains). It takes the data area and cluster size from the filesystem, writes
-`/bambu-mcp-card.json` with a new random `card_id`, and requires fsck to be clean again. The
-server, on one FTPS session of its own printer session and only while the printer reports no
+The capacity comes from a clean `fsck.fat -n -v` of the card (no wrong free-cluster summary, lost
+clusters or over-long chains): its data area and cluster size, written to `/bambu-mcp-card.json` on
+the card with a new random `card_id`. Two operator paths write that record:
+
+* `ops/attest_sd_card.py`, card in a computer: fsck, write the record, fsck again.
+* `ops/register_sd_card.py`, card in the printer: from saved fsck output of the card, taken on a
+  computer earlier (for example right after formatting). See "Operator: register a card that stays in
+  the printer".
+
+The server, on one FTPS session of its own printer session and only while the printer reports no
 job, lists the whole card with `LIST` and reads that record. The listing must be complete: a
 folder the printer refuses to list (550, which bpm's listing reads as empty), a row that is not a
 file or folder (a link, a device, a row that does not parse; bpm's listing skips those) or a folder
@@ -82,13 +87,19 @@ All are `{"error": code, "detail", ...}` before anything is written or sent:
 | `storage_unattested` | no `/bambu-mcp-card.json` on the card, or not a valid record |
 | `storage_unknown` | the record could not be read, or the listing is incomplete (`folder` names where: a folder the printer refused, a row that is not a file or folder) |
 | `storage_insufficient` | `storage` carries `available_bytes` (the figure the decision used), `required_bytes`, `required` (job, unpacked_gcode, reserve), `data_bytes`, `listed_allocated_bytes`, `files`, `folders`, `card_id`, `sd_card` |
-| `storage_record_protected` | `upload_file` to, or `rename_sdcard_file` onto, `/bambu-mcp-card.json` (any case, trailing dots, or its 8.3 alias): only the attestation script writes the record, so a caller cannot claim a size |
+| `storage_record_protected` | `upload_file` to, or `rename_sdcard_file` onto, `/bambu-mcp-card.json` (any case, trailing dots, or its 8.3 alias): only the operator paths (attest, register) write the record, so a caller cannot claim a size |
 | `storage_card_changed` | at the start, the card's record is not the one the upload bound; the admission is dropped |
+| `registration_missing`, `registration_invalid`, `registration_store_untrusted` | `register_sd_card`: no pending registration with that id (never made, or already used), or one that does not validate (wrong printer, older than 15 minutes, no custody statement, fsck logs not clean or not of one filesystem); the registration store is not a 0700 directory of the service user |
+| `storage_already_attested`, `registration_inconsistent` | `register_sd_card`: the card already has a record (it is never replaced), or it lists more than the logs' data area (not the card they describe) |
+| `registration_failed` | `register_sd_card`: the record's write or read-back failed; the detail says what the card may hold |
 
 A start refused for space keeps its admission: free space on the card, then call `print_file`
 again. The server never deletes, formats or repairs anything to make room, and has no override.
 `get_printer_connection_status` shows `telemetry.storage`: the SD state reported on this
 connection, any timelapse-storage free figure (not used) and the latest space check with its age.
+Every space result carries `attested_at` (when the fsck behind the record ran) and `basis` (how the
+record was made). `available_bytes` is an estimate from that data area and the listing just taken,
+not a free-space reading.
 
 ## Operator: attest a card
 
@@ -102,9 +113,52 @@ sudo python3 ops/attest_sd_card.py /dev/mmcblk0p1
 A card that fails fsck is reported and left alone; check or format it yourself, then attest. If the card
 fails after the record was written (write, read-back or the second fsck), the script deletes the record
 again and says whether that worked, so a failed attestation never leaves a record the server accepts.
-The record is a file on the card; the server refuses to write it (`storage_record_protected`). Re-attest
+The record is a file on the card; uploads and renames onto it are refused (`storage_record_protected`). Re-attest
 after reformatting. Moving files on the card from a computer is fine (the server lists the card each
 time); a corrupted card is not, so re-attest after an unclean removal or power loss during a write.
+
+## Operator: register a card that stays in the printer
+
+For a card that was checked on a computer (a clean `fsck.fat -n -v` saved, e.g. after formatting)
+and went back into the printer without a record. On the bambu-mcp host, as the service user, with
+the printer idle and the service running:
+
+```sh
+cd ~/.local/share/bambu-mcp
+.venv-candidate/bin/python ops/register_sd_card.py --printer p1s \
+    --fsck-log <dir>/fsck-after-format.log --fsck-log <dir>/fsck-final.log \
+    --evidence <dir>/result.json --evidence <dir>/format.log \
+    --custody "<who checked the card where and when, and how it got back into this printer>"
+```
+
+`--check` first validates the logs and writes nothing. Then:
+
+1. The CLI reads each `--fsck-log` (oldest first). Each must be `fsck.fat -n` output with no problem
+   line that ends in its summary (`<device>: N files, used/total clusters`); at least one must be
+   verbose (`-v`), giving the data area and cluster size; all must name the same device, cluster
+   count and cluster size. `--evidence` files are hashed into the receipt and not interpreted. The
+   newest log's modification time becomes `attested_at`.
+2. It writes a one-shot registration (logs included) to `~/.bambu-mcp/sd-card/<id>.json` (directory
+   0700) and calls `register_sd_card(name, <id>)` on the server's HTTP MCP endpoint
+   (`~/.bambu-mcp/daemon.port`, or `--mcp URL`).
+3. The server renames the registration to `<id>.used.json` before reading it (used once, whatever
+   follows), requires it to be under 15 minutes old and for this printer, and parses the logs
+   itself. Under the SD-card lock, on one FTPS session of its own printer session (refused while the
+   printer reports a job), it lists the whole card (incomplete refuses), requires no existing record
+   and no more listed than the data area, writes `/bambu-mcp-card.json`, reads it back, and then
+   measures the card as an upload would.
+4. The CLI prints the answer (the card's `storage` as uploads will see it) and saves it with the
+   registration to `~/.bambu-mcp/sd-card/<id>.receipt.json`. Exit 0 only when registered.
+
+The record's `basis` says it came from an operator registration, when fsck ran, that the card was
+not checked after it went into the printer, and the custody statement.
+
+Trust boundary. The record states the card's size, so only the operator writes it. MCP callers
+cannot: `upload_file` and `rename_sdcard_file` refuse the record's name; `download_file` (the one
+tool that writes a caller-chosen host path) refuses destinations in `~/.bambu-mcp/sd-card/`, so a
+caller cannot place a registration; `register_sd_card` takes no size and applies only a pending
+registration whose random id the CLI printed. A process running as the service user on the host
+can do all of this itself; it is the operator.
 
 ## Limits
 
@@ -114,6 +168,10 @@ time); a corrupted card is not, so re-attest after an unclean removal or power l
   entries in a folder) is not detected.
 * The card's identity is not read (no CID or volume serial is visible over FTPS); a record copied onto
   another card, or written onto the card from a computer by hand, is believed.
+* A registration links the fsck logs to the card in the printer only by the operator's custody
+  statement. The server checks that the card has no record and lists no more than the logs' data
+  area, nothing more. The filesystem's health is as of that fsck, not now: corruption since then
+  (an unclean power loss during a write) is not detected beyond the reserve.
 * Between the measurement and the printer's unpacking, another client (Bambu Studio, Handy, a timelapse)
   can fill the card. The reserve absorbs some of it; the start is not watched afterwards.
 * Non-job files (`upload_file` of a `.txt`, etc.) are not space-checked.
@@ -123,3 +181,6 @@ time); a corrupted card is not, so re-attest after an unclean removal or power l
   on platt: a clean image was attested; one with a wrong FSINFO free count was refused with the image
   unchanged; one made unclean between the write and the second fsck (a wrong FSINFO free count written
   to the device) was refused and the record deleted (fsck -l lists no record afterwards).
+* E2E runs `ops/register_sd_card.py` as its own process against the server over HTTP MCP, with fsck
+  logs of real FAT32 images (`mkfs.fat`, 32 KiB clusters) made in the test; the card it registers
+  is the fixture's.

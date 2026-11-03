@@ -13,7 +13,7 @@ Source: [synman/bambu-mcp](https://github.com/synman/bambu-mcp) on GitHub.
 
 | Surface | Count | Reference |
 |---|---|---|
-| MCP tools | 106 (52 read-only, 54 write, 50 need `user_permission=True`) | [MCP Tools](tools/index.md) |
+| MCP tools | 107 (52 read-only, 55 write, 51 need `user_permission=True`) | [MCP Tools](tools/index.md) |
 | REST API routes | 87 | [REST API](rest-api.md) |
 | MCP resources | 4 rules files plus 1 alert feed template | [Resources](#resources-and-prompt) |
 | MCP prompts | 1 (`bambu_system_context`) | [Resources](#resources-and-prompt) |

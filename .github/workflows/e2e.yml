@@ -23,8 +23,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      - name: Install network isolation tools
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap openssl
+      - name: Install network isolation and FAT filesystem tools
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap openssl dosfstools
       - name: Rebuild from repository only
         run: python ops/bootstrap.py
       - name: Generated tool documentation is current
