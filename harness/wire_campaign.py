@@ -513,6 +513,14 @@ async def campaign(seed, cycles):
                     assert broker.connections == connections + 1, "replacement connections did not widen"
                     again = (await call("get_printer_connection_status"))["telemetry"]
                     assert again["restarts"] == restarts + 1 and not again["writable"], again
+                    # The next replacement reaches the configured cap (7s), rather than doubling
+                    # indefinitely. The existing first-replacement check does not own saturation.
+                    second_start = time.monotonic()
+                    while broker.connections == connections + 1 and time.monotonic() - start < 16.:
+                        await asyncio.sleep(.1)
+                    second_at = time.monotonic() - start
+                    assert broker.connections == connections + 2 and 11. <= second_at <= 14.5, (second_at, broker.connections)
+                    connections += 1  # recovery below must keep this second replacement connection
                     # The printer reports again: the backed-off full-state request is answered on the
                     # connection that exists, with no further reconnect.
                     broker.reports = True

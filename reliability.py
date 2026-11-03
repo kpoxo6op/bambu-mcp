@@ -140,6 +140,15 @@ def _canonical(payload) -> str | None:
         return None
 
 
+def _bounded_backoff(initial: float, cap: float, count: int) -> float:
+    # Saturate before calculating another power: long outages must not overflow a float.
+    value = min(initial, cap)
+    while count > 0 and value < cap:
+        value = min(cap, value * 2)
+        count -= 1
+    return value
+
+
 def is_read_only_request(payload) -> bool:
     """True only for the version, pushall and push-start requests; any other payload is a printer write."""
     return _canonical(payload) in _READ_ONLY_REQUESTS
@@ -439,7 +448,7 @@ class ReliablePrinter(BambuPrinter):
     def _rel_full_state_wait(self, now: float) -> float:
         """Seconds until another full-state request may be sent (caller holds _rel_lock)."""
         n = self._rel_full_unanswered
-        gap = 0.0 if n == 0 else min(PUSHALL_MAX_S, PUSHALL_EVERY_S * 2 ** (n - 1))
+        gap = 0.0 if n == 0 else _bounded_backoff(PUSHALL_EVERY_S, PUSHALL_MAX_S, n - 1)
         return max(0.0, self._rel_last_pushall_req + gap - now)
 
     def _rel_full_state_slot(self) -> bool:
@@ -947,7 +956,7 @@ class _Supervisor:
         # The printer answers but does not report: a new connection was not seen to help (2026-11-03,
         # 39 of them), so replace it only on a doubling schedule kept per printer across sessions.
         answering = h.get("printer_answering")
-        limit = (min(NO_REPORT_RECONNECT_MAX_S, NO_REPORT_RECONNECT_S * 2 ** e["quiet_replacements"])
+        limit = (_bounded_backoff(NO_REPORT_RECONNECT_S, NO_REPORT_RECONNECT_MAX_S, e["quiet_replacements"])
                  if answering else FORCE_RECONNECT_AFTER_S)
         if silent > limit and connected_for > limit:
             requested = e["reconnect_requested"]
@@ -958,7 +967,7 @@ class _Supervisor:
                     log.warning("supervisor: %s answers but sent no usable telemetry for %.0fs; replacing the "
                                 "connection (replacement %d; next no sooner than %.0fs)", name, silent,
                                 e["quiet_replacements"],
-                                min(NO_REPORT_RECONNECT_MAX_S, NO_REPORT_RECONNECT_S * 2 ** e["quiet_replacements"]))
+                                _bounded_backoff(NO_REPORT_RECONNECT_S, NO_REPORT_RECONNECT_MAX_S, e["quiet_replacements"]))
                 else:
                     log.warning("supervisor: %s connected without usable telemetry or any well-formed message "
                                 "for %.0fs; dropping the connection", name, silent)
