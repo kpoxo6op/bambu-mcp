@@ -36,8 +36,14 @@ What this module adds, without editing bpm (``ReliablePrinter`` subclasses ``Bam
   no report arrived and full-state requests were ignored. The supervisor then dropped the
   connection 120 s after every connect, 39 times; paho labels that client-side disconnect()
   "Normal disconnection", and no new connection brought a report. Such a connection is now
-  replaced only on a doubling schedule, while full-state and report-streaming requests continue
-  with back-off and health reports the printer as answering but not reporting.
+  replaced only on a doubling schedule, and health reports the printer as answering but not reporting.
+* Requests that keep reports flowing follow the vendor client (Bambu Studio DeviceCore/DevManager.cpp
+  keep_alive/check_pushing): a stream request after PUSH_START_AFTER_S without a status report,
+  repeated at most every PUSH_START_EVERY_S, on its own timer; a full-state request at a fixed
+  PUSHALL_EVERY_S while telemetry is not live (bpm's own watchdog cadence) and every
+  PUSHALL_KEEPALIVE_S while it is. On 2026-11-03 the stream request rode on the supervisor's
+  full-state request only, and bpm's watchdog, asking on the same cadence, usually took that
+  shared slot first with a plain pushall, so after one full report the printer went quiet again.
   If that thread cannot be stopped, writes stay blocked. In daemon mode (or with
   BAMBU_MCP_WATCHDOG_EXIT=1) the process exits with code 70 so systemd restarts it.
 """
@@ -62,8 +68,10 @@ log = logging.getLogger(__name__)
 
 # Thresholds (seconds). Module-level so offline tests can shrink them.
 STALE_AFTER_S = 45.0          # no processed print telemetry for this long → stale (bpm asks pushall at 30)
-PUSHALL_EVERY_S = 30.0        # gap after an unanswered full-state request (doubles per unanswered one); version probe gap
-PUSHALL_MAX_S = 300.0         # cap on that gap: P1-series printers lag when asked for full state more often
+PUSHALL_EVERY_S = 30.0        # gap after an unanswered full-state request (bpm's watchdog cadence); version probe gap
+PUSHALL_KEEPALIVE_S = 300.0   # full-state request while live, as Bambu Studio's keep_alive (TIMEOUT_FOR_KEEPALIVE)
+PUSH_START_AFTER_S = 20.0     # no status report this long → stream request (Studio TIMEOUT_FOR_STRAT)
+PUSH_START_EVERY_S = 15.0     # at most this often (Studio REQUEST_START_MIN_TIME)
 FORCE_RECONNECT_AFTER_S = 120.0  # connected, no usable telemetry and nothing well-formed received this long → disconnect
 NO_REPORT_RECONNECT_S = 300.0    # the printer answers but sends no usable report: first replacement after this long,
 NO_REPORT_RECONNECT_MAX_S = 3600.0  # doubling per replacement (per printer, across sessions) up to this
@@ -80,9 +88,9 @@ PROJECT_LOOKUP_ATTEMPTS = 3
 EXIT_CODE_STUCK = 70
 
 _ACTIVE_JOB_STATES = ("PREPARE", "RUNNING", "PAUSE")
-# Asks the printer to (re)start streaming status reports; the pushing namespace controls push updates
-# only (vendor/bambu-printer-manager/docs/mqtt-protocol-reference.md). Sent with a full-state request
-# after an earlier one went unanswered.
+# Asks the printer to (re)start streaming status reports. Bambu Studio sends exactly this after 20 s
+# without a message to printers whose profile lacks support_mqtt_alive (MachineObject::command_pushing,
+# DevManager::check_pushing); ha-bambulab sends it after 60 s without data. It changes no printer state.
 REQUEST_PUSH_START = {"pushing": {"command": "start", "sequence_id": "0"}}
 _READ_ONLY_REQUESTS = (
     json.dumps(ANNOUNCE_PUSH, sort_keys=True),
@@ -275,6 +283,8 @@ class ReliablePrinter(BambuPrinter):
         self._rel_connect_error: str | None = None
         self._rel_last_pushall_req = 0.0
         self._rel_last_version_req = 0.0
+        self._rel_last_start_req = 0.0
+        self._rel_push_starts = 0
         # Last message parsed without error, of any kind (replies included): the printer is answering.
         self._rel_last_valid: float | None = None
         # Full-state requests on this connection, and how many were sent since the last full report.
@@ -447,13 +457,12 @@ class ReliablePrinter(BambuPrinter):
 
     def _rel_full_state_wait(self, now: float) -> float:
         """Seconds until another full-state request may be sent (caller holds _rel_lock)."""
-        n = self._rel_full_unanswered
-        gap = 0.0 if n == 0 else _bounded_backoff(PUSHALL_EVERY_S, PUSHALL_MAX_S, n - 1)
+        gap = PUSHALL_EVERY_S if self._rel_full_unanswered else 0.0
         return max(0.0, self._rel_last_pushall_req + gap - now)
 
     def _rel_full_state_slot(self) -> bool:
         """Claim the next full-state request. The first on a connection, or the first after a full
-        report, goes at once; while requests stay unanswered the gap doubles up to PUSHALL_MAX_S."""
+        report, goes at once; while one is unanswered the next waits PUSHALL_EVERY_S."""
         now = time.monotonic()
         with self._rel_lock:
             if self._rel_full_state_wait(now) > 0:
@@ -464,27 +473,45 @@ class ReliablePrinter(BambuPrinter):
             return True
 
     def _request_pushall(self, client=None) -> bool:
-        """Read-only full-state request, within the shared back-off. Never a printer write.
-
-        After an unanswered request it also asks the printer to start streaming reports, which a
-        printer that stopped pushing needs and one that is pushing ignores."""
+        """Read-only full-state request, within the slot shared with bpm's watchdog and refresh().
+        Never a printer write."""
         client = client or self._client
         if client is None:
             return False
         try:
             if not client.is_connected():
                 return False
-            with self._rel_lock:
-                unanswered = self._rel_full_unanswered
             if not self._rel_full_state_slot():
                 return False
-            topic = f"device/{self.config.serial_number}/request"
-            if unanswered:
-                client.publish(topic, json.dumps(REQUEST_PUSH_START))
-            client.publish(topic, json.dumps(ANNOUNCE_PUSH))
+            client.publish(f"device/{self.config.serial_number}/request", json.dumps(ANNOUNCE_PUSH))
             return True
         except Exception as exc:
             log.debug("ReliablePrinter: pushall request failed: %s", exc)
+            return False
+
+    def _request_push_start(self) -> bool:
+        """Read-only stream request once no status report arrived for PUSH_START_AFTER_S on this
+        connection, at most every PUSH_START_EVERY_S. Its own timer: no other request source can
+        take its turn."""
+        client = self._client
+        now = time.monotonic()
+        with self._rel_lock:
+            connected_at, last_tel = self._rel_connected_at, self._rel_last_telemetry
+            quiet_since = connected_at if last_tel is None or (connected_at is not None and last_tel < connected_at) \
+                else last_tel
+            if (connected_at is None or now - quiet_since < PUSH_START_AFTER_S
+                    or now - self._rel_last_start_req < PUSH_START_EVERY_S):
+                return False
+            self._rel_last_start_req = now
+        try:
+            if client is None or not client.is_connected():
+                return False
+            client.publish(f"device/{self.config.serial_number}/request", json.dumps(REQUEST_PUSH_START))
+            with self._rel_lock:
+                self._rel_push_starts += 1
+            return True
+        except Exception as exc:
+            log.debug("ReliablePrinter: stream request failed: %s", exc)
             return False
 
     def _request_version(self) -> bool:
@@ -718,6 +745,7 @@ class ReliablePrinter(BambuPrinter):
                              "failed": self._rel_failed},
                 "printer_answering": answering,
                 "report_subscription": subscription,
+                "stream_requests": self._rel_push_starts,
                 "full_state": {"requests": self._rel_full_requests, "unanswered": unanswered,
                                "last_request": age(self._rel_last_pushall_req or None),
                                "last_full_report": age(self._rel_last_full_report),
@@ -916,7 +944,12 @@ class _Supervisor:
             return
         h = p.health_snapshot()
         status = h["status"]
+        if h["mqtt_connected"] and h["session_thread_alive"] and status not in ("paused", "stuck"):
+            # Read-only, on its own timer: reports quiet for PUSH_START_AFTER_S, even while still live.
+            p._request_push_start()
         if status == "live":
+            if now - p._rel_last_pushall_req > PUSHALL_KEEPALIVE_S:
+                p._request_pushall()  # vendor keep-alive while reports flow
             e["stuck_since"] = None
             e["reconnect_requested"] = None
             if e["live_since"] is None:

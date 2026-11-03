@@ -106,9 +106,28 @@ class Broker:
         # SUBACK failure (0x80) for the report topic; such a peer is sent nothing on that topic.
         self.refuse_subscribe = False
         self.unsubscribed = set()
+        # Status reports flow only while a stream request ({"pushing": {"command": "start"}}) is at
+        # most lease_s old: the request Bambu Studio sends after 20 s without a message
+        # (DeviceCore/DevManager.cpp check_pushing) and ha-bambulab after 60 s. Each report advances
+        # the layer. This is the vendor clients' renewal, not behaviour shown on the live firmware.
+        self.lease_s = None
+        self.lease_until = 0.
+        self.layer = 2
         self.held_max = 0
         self.stop = threading.Event()
         threading.Thread(target=self.accept, daemon=True).start()
+        threading.Thread(target=self.stream, daemon=True).start()
+
+    def stream(self):
+        while not self.stop.is_set():
+            if self.lease_s and time.monotonic() < self.lease_until:
+                self.broadcast(self.delta())
+            time.sleep(.2)
+
+    def delta(self):
+        self.layer += 1
+        return {"print": {"command": "push_status", "msg": 1, "layer_num": self.layer,
+                          "mc_percent": min(99, self.layer), "nozzle_temper": 240., "bed_temper": 75.}}
 
     def accept(self):
         while not self.stop.is_set():
@@ -212,6 +231,8 @@ class Broker:
                     self.received.append(msg)
                     if peer in self.unsubscribed:
                         continue
+                    if self.lease_s and msg.get("pushing", {}).get("command") == "start":
+                        self.lease_until = time.monotonic() + self.lease_s
                     if self.reports and msg.get("pushing", {}).get("command") == "pushall":
                         self.report(peer)
                     elif self.answering and msg.get("info", {}).get("command") == "get_version":
@@ -241,13 +262,16 @@ class Broker:
         return sum(1 for m in self.received if m.get("pushing", {}).get("command") == "pushall")
 
     def drop(self):
+        # Shut down only; the peer's serve thread closes its own socket. Closing it here, while
+        # that thread is inside SSL_read, freed the fd number while OpenSSL still read from it: the
+        # next HTTP connection reused it and lost its first 5 bytes ("HTTP/") as a TLS record
+        # header ("illegal status line: 1.1 200 OK", also nightly 2026-11-02 seed 309119290).
         for peer in list(self.peers):
             self.peers.discard(peer)
             try:
                 peer.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            peer.close()
 
     def close(self):
         self.stop.set()
@@ -472,9 +496,9 @@ async def campaign(seed, cycles):
                     # full-state request. The supervisor dropped the connection 120 s after each connect
                     # (paho names our own disconnect() "Normal disconnection"), 39 times without effect,
                     # and health said "starting" throughout. A printer that answers is not a dead link:
-                    # state stays unknown and writes refused, health says why, full-state requests back
-                    # off, the connection is replaced only on a widening schedule, and a late report is
-                    # used on the same connection.
+                    # state stays unknown and writes refused, health says why, full-state requests keep a
+                    # fixed cadence, the connection is replaced only on a widening schedule, and a late
+                    # report is used on the same connection.
                     before = len(broker.mutations())
                     broker.reports = False
                     broker.answering = True
@@ -501,7 +525,7 @@ async def campaign(seed, cycles):
                     assert state.get("error") == "telemetry_not_live", state
                     await refuses_writes()
                     sent = broker.full_state_requests() - requests
-                    assert 2 <= sent <= 5, f"{sent} full-state requests in 4s to a printer that ignores them"
+                    assert 4 <= sent <= 10, f"{sent} full-state requests in 4s at a 0.5s cadence"
                     assert any(m.get("pushing", {}).get("command") == "start" for m in broker.received), \
                         "report streaming was never requested"
                     # One replacement on the widening schedule, then none for a while.
@@ -521,7 +545,7 @@ async def campaign(seed, cycles):
                     second_at = time.monotonic() - start
                     assert broker.connections == connections + 2 and 11. <= second_at <= 14.5, (second_at, broker.connections)
                     connections += 1  # recovery below must keep this second replacement connection
-                    # The printer reports again: the backed-off full-state request is answered on the
+                    # The printer reports again: the next full-state request is answered on the
                     # connection that exists, with no further reconnect.
                     broker.reports = True
                     await until_live()
@@ -530,6 +554,43 @@ async def campaign(seed, cycles):
                     events.append({"fault":"answering-printer-without-reports","replaced_after_s":round(replaced,1),
                                    "full_state_requests_4s":sent,"recovery_s":round(time.monotonic()-start,3),
                                    "replayed":0})
+                    # Remaining 2026-11-03 failure after the fix above: one full report, then the printer went
+                    # quiet again while still answering get_version. A stream request was due only with the
+                    # supervisor's own full-state request, and bpm's watchdog, asking on the same 30 s cadence,
+                    # usually took that slot first with a plain pushall (request times 69/99/159 s live).
+                    # Whenever reports stop, the stream must be asked to resume whoever holds the slot, so
+                    # reporting continues with advancing progress on the same single connection.
+                    before, connections = len(broker.mutations()), broker.connections
+                    broker.reports = False
+                    broker.answering = True
+                    broker.lease_s = 1.
+                    broker.broadcast()  # the one full frame
+                    await until_live()
+                    first = (await call("get_print_progress"))["current_layer"]
+                    start, lapses = time.monotonic(), []
+                    while time.monotonic() - start < 6.:
+                        h = (await call("get_printer_connection_status"))["telemetry"]
+                        if not h["live"]:
+                            lapses.append((round(time.monotonic() - start, 1), h["status"], h["reason"]))
+                        await asyncio.sleep(.1)
+                    progress = await call("get_print_progress")
+                    assert not lapses, f"reporting lapsed in {len(lapses)} samples over 6s: {lapses[:3]}"
+                    assert progress["current_layer"] >= first + 12, (first, progress)
+                    # While reports stream, full state is still re-requested on the vendor keep-alive cadence.
+                    broker.lease_s = None
+                    pushalls, start = broker.full_state_requests(), time.monotonic()
+                    while time.monotonic() - start < 2.5:
+                        broker.broadcast(broker.delta())
+                        await asyncio.sleep(.2)
+                    kept = broker.full_state_requests() - pushalls
+                    assert 1 <= kept <= 2, f"{kept} full-state requests in 2.5s of continuous reports"
+                    assert broker.connections == connections and broker.maximum == 1, broker.connections
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    await health_until(lambda h: not h["live"], "stopped reports still read as live", timeout=5)
+                    await refuses_writes()
+                    broker.reports = True
+                    events.append({"fault":"one-full-report-then-quiet","layers_streamed":progress["current_layer"]-first,
+                                   "keepalive_requests_2_5s":kept,"replayed":0})
                     # The printer refuses the report subscription (SUBACK 0x80): nothing can arrive, so
                     # health names it and the connection is replaced until a subscription is granted.
                     connections = broker.connections

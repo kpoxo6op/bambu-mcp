@@ -469,7 +469,9 @@ def get_printer_connection_status(name: str) -> dict:
         printer still answers requests. ``printer_answering`` is True while well-formed messages
         (replies included) arrive on this connection. ``report_subscription`` is pending, granted
         or refused. ``full_state`` counts full-state requests on this connection: ``unanswered``
-        since the last full report, and ``next_request_in_s`` (the gap doubles while unanswered). Printer writes are refused unless ``writable`` is True; state tools return
+        since the last full report, and ``next_request_in_s`` (a fixed gap while one is unanswered;
+        a keep-alive request every 5 minutes while live). ``stream_requests`` counts requests asking
+        the printer to resume streaming reports, sent after 20 s without a status report. Printer writes are refused unless ``writable`` is True; state tools return
         ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
     """
     log.debug("get_printer_connection_status: called for name=%s", name)

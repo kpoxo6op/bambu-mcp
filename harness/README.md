@@ -45,10 +45,17 @@ Replay a failure:
   full-state request ignored. The old supervisor dropped such a connection 120 s after each
   connect (paho logs our own disconnect() as "Normal disconnection") and health said
   "starting". Now health must say stale and that the printer answers, writes are refused,
-  full-state requests back off (with a request to start streaming reports), the connection is
+  full-state requests keep a fixed cadence and a stream request is sent, the connection is
   replaced once at the widening threshold and not again within the doubled interval, and
   the late report makes it live on the existing connection. A refused report subscription
   (SUBACK 0x80) is named in health and the connection is replaced until one is granted.
+* After that fix the live P1S sent one full report and went quiet again, still answering.
+  The stream request rode on the supervisor's full-state request, and bpm's own watchdog,
+  asking on the same 30 s cadence (kept in the fixture), usually took that slot first. The
+  peer here streams only while a stream request is recent, as the requests Bambu Studio and
+  ha-bambulab send imply; that firmware behaviour is not shown on the live printer. Over 6 s
+  every health sample must be live with advancing layers on one connection, a full-state
+  keep-alive must still go out while reports stream, and writes are refused once they stop.
 * Client-side MQTT sockets are counted from `/proc/net/tcp` in the namespace at
   every accepted connection and after every fault. More than one ESTABLISHED or
   CLOSE_WAIT socket fails the run; CLOSE_WAIT is the 2026-11-01 leak.

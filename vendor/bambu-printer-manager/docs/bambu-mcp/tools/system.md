@@ -466,8 +466,8 @@ live session), or ``"Error triggering refresh for '<name>': <exception>"``.
 The tool calls printer.refresh(), which re-requests all state from the printer, but
 printer.refresh() publishes only while the BPM service state is CONNECTED. In any other
 state (for example PAUSED) it sends nothing, and the tool still returns the success
-string. The full-state request is also withheld while an earlier one is unanswered and
-its back-off has not elapsed (``telemetry.full_state.next_request_in_s`` in
+string. The full-state request is also withheld within 30 s of an earlier unanswered one
+(``telemetry.full_state.next_request_in_s`` in
 ``get_printer_connection_status``). Check ``get_session_status`` if state does not update.
 
 ## truncate_log
