@@ -9,6 +9,7 @@ import logging
 log = logging.getLogger(__name__)
 
 from session_manager import session_manager
+from reliability import SdCardBusy
 
 
 def _no_printer(name: str) -> dict:
@@ -663,6 +664,10 @@ def _get_plate_image(
 
         log.debug("_get_plate_image: %s plate=%s quality=%s → %dx%d %d bytes", image_key, plate_num, quality, w, h, len(jpeg_bytes))
         return {"data_uri": jpeg_uri, "plate_num": plate_num, "quality": quality, "width": w, "height": h}
+    except SdCardBusy as e:
+        # The job monitor asks every minute during a print; the refusal is expected there.
+        log.debug("_get_plate_image: %s: %s", name, e)
+        return {"error": f"Error retrieving plate image: {e}"}
     except Exception as e:
         log.error("_get_plate_image: error for %s: %s", name, e, exc_info=True)
         return {"error": f"Error retrieving plate image: {e}"}

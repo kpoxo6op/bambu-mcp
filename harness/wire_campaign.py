@@ -501,7 +501,7 @@ async def campaign(seed, cycles):
                     await asyncio.sleep(.15)
                     assert len(broker.mutations()) == 1, broker.mutations()
                     for i in range(cycles):
-                        fault = ["drop", "silence", "malformed", "job-ftps-reset"][i % 4]
+                        fault = ["drop", "silence", "malformed", "job-no-ftps"][i % 4]
                         before = len(broker.mutations())
                         connections = broker.connections
                         start = time.monotonic()
@@ -517,17 +517,23 @@ async def campaign(seed, cycles):
                             broker.broadcast(b"{broken-json")
                             await asyncio.sleep(.15)
                         else:
+                            # 2026-11-03: the P1S printing from SD sent no status report while our
+                            # 3MF download ran. The job start used to trigger a project lookup over
+                            # FTPS within 2 s; no connection may reach the card during a job.
+                            ftps_before = ftps.connections
                             broker.running = not broker.running
                             broker.broadcast()
                             await asyncio.sleep(.2)
                             progress = await call("get_print_progress")
                             assert progress.get("gcode_state") == ("RUNNING" if broker.running else "IDLE"), progress
-                            for _ in range(20):
-                                if ftps.resets:
-                                    break
-                                await asyncio.sleep(.1)
-                            assert ftps.resets, "job transition never reached the FTPS reset peer"
-                        if fault != "job-ftps-reset":
+                            if broker.running:
+                                listing = await call("list_sdcard_files")
+                                assert "SD card access is refused while the printer reports gcode_state RUNNING" \
+                                    in str(listing), listing
+                            await asyncio.sleep(1.5)
+                            assert ftps.connections == ftps_before, ("FTPS during a job transition",
+                                                                     ftps.connections - ftps_before)
+                        if fault != "job-no-ftps":
                             state = await call("get_print_progress")
                             assert state.get("error") == "telemetry_not_live", state
                             refusal = await call("set_chamber_light", on=False, user_permission=True)
@@ -1091,6 +1097,13 @@ async def campaign(seed, cycles):
                         await asyncio.sleep(.1)
                     else:
                         raise AssertionError("RUNNING telemetry not delivered")
+                    ftps_before = ftps.connections
+                    for tool, args in [("list_sdcard_files", {}),
+                                       ("get_project_info", {"file_path":"fixture-job.gcode.3mf"}),
+                                       ("upload_file", {"local_path":str(tmp/"notes.txt"), "user_permission":True,
+                                                        "remote_path":"/during-print.txt"})]:
+                        refused = await call(tool, **args)
+                        assert "SD card access is refused" in str(refused), (tool, refused)
                     before = len(broker.mutations())
                     for tool, args in [
                         ("load_filament", {"unit_id":0,"slot_id":254}),
@@ -1114,6 +1127,10 @@ async def campaign(seed, cycles):
                     # the peer only requires that those authenticated connections exist.
                     assert camera.authenticated >= 3, camera.authenticated
                     events.append({"contract":"camera returns fresh second frame and recovers after invalid header"})
+                    # The job monitor's frame capture above runs with its plate-image fetch; neither
+                    # it nor the refused tools may open FTPS while the printer reports a job.
+                    assert ftps.connections == ftps_before, ("FTPS during a print", ftps.connections - ftps_before)
+                    events.append({"contract":"no SD card access while the printer reports a job"})
                     # A second process must fail at the shared singleton before opening MQTT.
                     before = broker.connections
                     duplicate = await asyncio.create_subprocess_exec(

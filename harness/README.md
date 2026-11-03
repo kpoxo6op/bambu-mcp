@@ -28,8 +28,13 @@ Replay a failure:
   not a reason to restart the service.
 * The printer rejects the LAN access code (CONNACK 5). Status must say
   "Not authorized" rather than a generic "connecting", and writes are refused.
-* A real TCP reset during the job-start FTPS handshake must not stop MQTT state
-  updates or force a replacement MQTT connection.
+* No FTPS connection reaches the printer while it reports a job. On 2026-11-03 the
+  P1S, printing from SD, served our 3MF downloads at about 1 KB/s and sent no status
+  report while one ran (it still answered get_version); the job start triggered a
+  project lookup over FTPS within 2 s, and the job monitor fetched plate images every
+  minute. Across job transitions, during the print workflow (the job monitor capturing
+  frames) and for SD listing, project info and upload tools, the FTPS peer must accept
+  no connection; the tools name the job state. After the job, the same tools use FTPS again.
 * Stale, malformed, starting and disconnected telemetry must be visibly rejected
   by public state/write tools. Health and camera remain diagnostic tools.
 * The pinned **real paho** client and **real FastMCP HTTP** server connect to a

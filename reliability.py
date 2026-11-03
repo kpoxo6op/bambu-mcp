@@ -12,10 +12,20 @@ session. A write sent then would have been written into a dead socket and report
 What this module adds, without editing bpm (``ReliablePrinter`` subclasses ``BambuPrinter``):
 
 * The MQTT thread only parses. FTPS that bpm would run inside a message callback fails fast
-  there; a bounded per-printer worker does the job's project lookup afterwards. ``on_update``
-  fan-out (notifications, data collector, job monitor) is coalesced onto that worker.
+  there (bpm then uses its metadata cache). ``on_update`` fan-out (notifications, data
+  collector, job monitor) is coalesced onto a per-printer worker.
   An exception while parsing a message is caught, counted and marks state incomplete. It
   never kills the loop.
+* No FTPS while a job runs. On 2026-11-03 the P1S, printing from SD, served our 3MF downloads
+  (job monitor plate images, the job's project lookup) at about 1 KB/s for tens of minutes.
+  While one ran it streamed no report and left most full-state requests unanswered, but still
+  answered get_version: the MQTT link itself was fine (its TCP byte counts were the version
+  replies alone). The first full report after a service restart came before any download began;
+  reports stopped once one did. With the same process and code, the previous evening's print
+  reported throughout: its lookups failed at once ("not found") and nothing was downloaded.
+  ftp_connection(), which every bpm SD-card operation goes through, is refused unless the last
+  reported gcode_state is idle (IDLE, FINISH, FAILED), so no caller can read or write the card
+  during a print.
 * Monotonic receive/processed timestamps per session. A new session or reconnect is
   "starting" until gcode_state, bed and nozzle values have been processed again. ``health()``
   derives one status from those facts and never trusts bpm's ``recent_update`` or
@@ -57,14 +67,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import threading
 import time
 
 import paho.mqtt.client as paho_client
 from bpm.bambucommands import ANNOUNCE_PUSH, ANNOUNCE_VERSION
 from bpm.bambuprinter import BambuPrinter
-from bpm.bambuproject import get_3mf_entry_by_name, get_project_info
 from bpm.bambutools import ServiceState
 
 import print_admission
@@ -89,10 +97,10 @@ BACKOFF_MAX_S = 60.0
 BACKOFF_RESET_AFTER_LIVE_S = 120.0
 SUPERVISOR_TICK_S = 1.0
 SUPERVISOR_DEAD_AFTER_S = 15.0
-PROJECT_LOOKUP_ATTEMPTS = 3
 EXIT_CODE_STUCK = 70
 
-_ACTIVE_JOB_STATES = ("PREPARE", "RUNNING", "PAUSE")
+# The only gcode_states in which this server opens FTPS to the printer (see SdCardBusy).
+_SD_IDLE_STATES = ("IDLE", "FINISH", "FAILED")
 # Asks the printer to (re)start streaming status reports. Bambu Studio sends exactly this after 20 s
 # without a message to printers whose profile lacks support_mqtt_alive (MachineObject::command_pushing,
 # DevManager::check_pushing); ha-bambulab sends it after 60 s without data. It changes no printer state.
@@ -114,7 +122,11 @@ class PublishUnconfirmed(RuntimeError):
 
 
 class DeferredFtps(OSError):
-    """FTPS requested from the MQTT thread; deferred to the worker instead of blocking parsing."""
+    """FTPS requested from the MQTT thread; refused there instead of blocking parsing."""
+
+
+class SdCardBusy(OSError):
+    """FTPS refused: the printer last reported a job that may be running (2026-11-03)."""
 
 
 _tls = threading.local()
@@ -271,10 +283,6 @@ class ReliablePrinter(BambuPrinter):
         self._rel_worker_event = threading.Event()
         self._rel_worker_stop = threading.Event()
         self._rel_update_pending = False
-        self._rel_project_pending = False
-        self._rel_project_key = None
-        self._rel_project_attempts = 0
-        self._rel_project_next = 0.0
         self._rel_proxy = None
         self._rel_quit_ok = True
 
@@ -379,8 +387,6 @@ class ReliablePrinter(BambuPrinter):
             with self._rel_lock:
                 if self._rel_baseline_at is not None:
                     self._rel_last_usable = self._rel_last_telemetry
-        if self._rel_project_pending:
-            self._rel_worker_event.set()
 
     def _notify_update(self):
         # Coalesced: the worker delivers at most one pending on_update at a time.
@@ -391,22 +397,33 @@ class ReliablePrinter(BambuPrinter):
             self._rel_update_pending = False
             super()._notify_update()
 
-    # FTPS from inside a message callback fails fast; the worker repeats the lookup.
+    def sd_card_refusal(self) -> str | None:
+        """Why FTPS to this printer is refused now, or None when the last report says it is idle."""
+        state = self.printer_state.gcode_state or ""
+        if state in _SD_IDLE_STATES:
+            return None
+        shown = f"reports gcode_state {state}" if state else "has not reported its job state on this session"
+        return (f"SD card access is refused while the printer {shown}: during a print from SD the P1S "
+                "stopped sending status reports for as long as a file transfer ran (2026-11-03). "
+                "Retry once it reports IDLE, FINISH or FAILED. Nothing was read or changed.")
+
+    # Every bpm SD-card operation opens its FTPS session here. From inside a message callback it
+    # fails fast (bpm falls back to its cache); during a job it is refused.
     def ftp_connection(self):
         if _in_mqtt_callback():
-            self._rel_project_pending = True
-            raise DeferredFtps("FTPS deferred off the MQTT thread")
+            raise DeferredFtps("FTPS refused on the MQTT thread")
+        refusal = self.sd_card_refusal()
+        if refusal:
+            raise SdCardBusy(refusal)
         return super().ftp_connection()
 
     def get_sdcard_contents(self):
         if _in_mqtt_callback():
-            self._rel_project_pending = True
             return None
         return super().get_sdcard_contents()
 
     def get_sdcard_3mf_files(self):
         if _in_mqtt_callback():
-            self._rel_project_pending = True
             return None
         return super().get_sdcard_3mf_files()
 
@@ -660,7 +677,7 @@ class ReliablePrinter(BambuPrinter):
             log.error("ReliablePrinter.quit: MQTT threads did not stop within %.0fs", timeout)
         return self._rel_quit_ok
 
-    # ── worker: on_update fan-out and deferred project lookup ────────────────
+    # ── worker: on_update fan-out ────────────────────────────────────────────
 
     def _rel_worker(self) -> None:
         while True:
@@ -674,55 +691,6 @@ class ReliablePrinter(BambuPrinter):
                     log.warning("ReliablePrinter: on_update callback failed: %s", exc)
             if self._rel_worker_stop.is_set():
                 break
-            if self._rel_project_pending:
-                try:
-                    self._deferred_project_lookup()
-                except Exception as exc:
-                    log.warning("ReliablePrinter: deferred project lookup failed: %s", exc)
-
-    def _deferred_project_lookup(self) -> None:
-        info = self._active_job_info
-        if (self.printer_state.gcode_state or "") not in _ACTIVE_JOB_STATES:
-            self._rel_project_pending = False
-            return
-        if info.project_info and info.project_info.id:
-            self._rel_project_pending = False
-            return
-        key = (self._task_id, info.subtask_name, info.gcode_file)
-        if key != self._rel_project_key:
-            self._rel_project_key, self._rel_project_attempts, self._rel_project_next = key, 0, 0.0
-        if self._rel_project_attempts >= PROJECT_LOOKUP_ATTEMPTS:
-            self._rel_project_pending = False
-            return
-        if time.monotonic() < self._rel_project_next:
-            return
-        self._rel_project_attempts += 1
-        self._rel_project_next = time.monotonic() + 20.0 * self._rel_project_attempts
-        match = re.search(r"plate_(\d{1,2})", info.gcode_file or "")
-        plate = int(match.group(1)) if match else (info.plate_num if info.plate_num > 0 else 1)
-        url = (info.project_file_command or {}).get("print", {}).get("url", "")
-        subtask = info.subtask_name or ""
-        names = [n for n in (url.rsplit("/", 1)[-1] if "://" in url else "",
-                             subtask if subtask.endswith(".3mf") else "",
-                             f"{subtask}.gcode.3mf" if subtask else "",
-                             f"{subtask}.3mf" if subtask else "")
-                 if n and n != "project_file.gcode.3mf"]
-        remote = self.get_sdcard_3mf_files()
-        entry = None
-        for n in names if remote else []:
-            entry = get_3mf_entry_by_name(remote, n)
-            if entry:
-                break
-        if not entry:
-            log.info("deferred project lookup: no SD entry for %s (attempt %d)", names, self._rel_project_attempts)
-            return
-        project = get_project_info(entry["id"], self, plate_num=plate)
-        if project and project.id and key == (self._task_id, info.subtask_name, info.gcode_file):
-            with self._state_lock:
-                info.project_info = project
-                info.project_info_fetch_attempted = True
-            self._persist_job_record(project.id, project.md5 or None, project.plate_num)
-            self._rel_project_pending = False
 
     # ── health ───────────────────────────────────────────────────────────────
 
