@@ -28,8 +28,16 @@ What this module adds, without editing bpm (``ReliablePrinter`` subclasses ``Bam
   ticket of an admitted print_file call, and file starts, SD-card or extruding G-code are
   refused whichever tool, route or internal caller published them.
 * Supervisor thread. It restarts a dead session with capped exponential backoff, requests
-  pushall (read-only) when telemetry is stale or incomplete, forces a reconnect when a live
-  socket stays silent, and never starts a replacement while the old loop thread is alive.
+  full state (read-only, backing off while unanswered) when telemetry is stale or incomplete,
+  forces a reconnect when a connected socket delivers nothing well-formed, and never starts a
+  replacement while the old loop thread is alive.
+* A printer that answers requests but sends no status report is not a dead link (incident
+  2026-11-03, live P1S printing from SD): MQTT stayed connected and get_version was answered, but
+  no report arrived and full-state requests were ignored. The supervisor then dropped the
+  connection 120 s after every connect, 39 times; paho labels that client-side disconnect()
+  "Normal disconnection", and no new connection brought a report. Such a connection is now
+  replaced only on a doubling schedule, while full-state and report-streaming requests continue
+  with back-off and health reports the printer as answering but not reporting.
   If that thread cannot be stopped, writes stay blocked. In daemon mode (or with
   BAMBU_MCP_WATCHDOG_EXIT=1) the process exits with code 70 so systemd restarts it.
 """
@@ -54,8 +62,11 @@ log = logging.getLogger(__name__)
 
 # Thresholds (seconds). Module-level so offline tests can shrink them.
 STALE_AFTER_S = 45.0          # no processed print telemetry for this long → stale (bpm asks pushall at 30)
-PUSHALL_EVERY_S = 30.0        # min gap between supervisor pushall requests while stale/incomplete
-FORCE_RECONNECT_AFTER_S = 120.0  # connected but no usable telemetry this long → disconnect so the session restarts
+PUSHALL_EVERY_S = 30.0        # gap after an unanswered full-state request (doubles per unanswered one); version probe gap
+PUSHALL_MAX_S = 300.0         # cap on that gap: P1-series printers lag when asked for full state more often
+FORCE_RECONNECT_AFTER_S = 120.0  # connected, no usable telemetry and nothing well-formed received this long → disconnect
+NO_REPORT_RECONNECT_S = 300.0    # the printer answers but sends no usable report: first replacement after this long,
+NO_REPORT_RECONNECT_MAX_S = 3600.0  # doubling per replacement (per printer, across sessions) up to this
 STUCK_CALLBACK_S = 60.0       # one message being processed this long → loop thread stuck
 STUCK_EXIT_AFTER_S = 120.0    # stuck this long (and exit allowed) → process exit for supervised restart
 QUIT_TIMEOUT_S = 15.0         # bpm quit() joins threads with no timeout; we bound it
@@ -69,10 +80,16 @@ PROJECT_LOOKUP_ATTEMPTS = 3
 EXIT_CODE_STUCK = 70
 
 _ACTIVE_JOB_STATES = ("PREPARE", "RUNNING", "PAUSE")
+# Asks the printer to (re)start streaming status reports; the pushing namespace controls push updates
+# only (vendor/bambu-printer-manager/docs/mqtt-protocol-reference.md). Sent with a full-state request
+# after an earlier one went unanswered.
+REQUEST_PUSH_START = {"pushing": {"command": "start", "sequence_id": "0"}}
 _READ_ONLY_REQUESTS = (
     json.dumps(ANNOUNCE_PUSH, sort_keys=True),
     json.dumps(ANNOUNCE_VERSION, sort_keys=True),
+    json.dumps(REQUEST_PUSH_START, sort_keys=True),
 )
+_FULL_STATE_REQUEST = json.dumps(ANNOUNCE_PUSH, sort_keys=True)
 
 
 class PublishRejected(RuntimeError):
@@ -114,14 +131,18 @@ def _record_outcome(outcome: dict) -> None:
         outcomes.append(outcome)
 
 
-def is_read_only_request(payload) -> bool:
-    """True only for bpm's version and pushall requests; any other payload is a printer write."""
+def _canonical(payload) -> str | None:
     try:
         if isinstance(payload, (bytes, bytearray)):
             payload = payload.decode("utf-8")
-        return json.dumps(json.loads(payload), sort_keys=True) in _READ_ONLY_REQUESTS
+        return json.dumps(json.loads(payload), sort_keys=True)
     except Exception:
-        return False
+        return None
+
+
+def is_read_only_request(payload) -> bool:
+    """True only for the version, pushall and push-start requests; any other payload is a printer write."""
+    return _canonical(payload) in _READ_ONLY_REQUESTS
 
 
 class _NotSent:
@@ -152,6 +173,8 @@ class _GuardedClient:
     def __setattr__(self, attr, value):
         if attr == "on_connect" and value is not None:
             value = self._printer._wrap_on_connect(value)
+            # Installed with on_connect, before connect(): the SUBACK cannot arrive unobserved.
+            self._real.on_subscribe = self._printer._on_subscribe
         elif attr == "on_disconnect" and value is not None:
             value = self._printer._wrap_on_disconnect(value)
         setattr(self._real, attr, value)
@@ -161,6 +184,9 @@ class _GuardedClient:
         real = self._real
         if is_read_only_request(payload):
             if real is not p._client or not real.is_connected():
+                return _NotSent()
+            # bpm's watchdog and refresh() ask for full state too; all of them share one back-off.
+            if _canonical(payload) == _FULL_STATE_REQUEST and not p._rel_full_state_slot():
                 return _NotSent()
             return real.publish(topic, payload, qos, retain, properties)
         # A printer write. Admission policy first (it also consumes a print_file start ticket),
@@ -239,6 +265,15 @@ class ReliablePrinter(BambuPrinter):
         # Kept apart from last_error, which the disconnect that follows a refusal overwrites.
         self._rel_connect_error: str | None = None
         self._rel_last_pushall_req = 0.0
+        self._rel_last_version_req = 0.0
+        # Last message parsed without error, of any kind (replies included): the printer is answering.
+        self._rel_last_valid: float | None = None
+        # Full-state requests on this connection, and how many were sent since the last full report.
+        self._rel_full_requests = 0
+        self._rel_full_unanswered = 0
+        self._rel_last_full_report: float | None = None
+        # "pending" until the report subscription's SUBACK, then "granted" or "refused (<code>)".
+        self._rel_subscription: str | None = None
         # nozzle_diameter exactly as the printer reported it since this connection began; print
         # admission matches a job to it. Never carried across a reconnect (the nozzle may change).
         self._rel_nozzle: str | None = None
@@ -260,6 +295,9 @@ class ReliablePrinter(BambuPrinter):
         with self._rel_lock:
             if "nozzle_diameter" in status:
                 self._rel_nozzle = str(status["nozzle_diameter"])
+            if {"gcode_state", "bed", "nozzle"} <= keys:  # one frame with the full state: a full report
+                self._rel_full_unanswered = 0
+                self._rel_last_full_report = time.monotonic()
             self._rel_covered |= keys
             if self._rel_baseline_at is None and {"gcode_state", "bed", "nozzle"} <= self._rel_covered:
                 self._rel_baseline_at = time.monotonic()
@@ -295,6 +333,7 @@ class ReliablePrinter(BambuPrinter):
                                                or bool({"gcode_state", "bed_temper", "nozzle_temper"} & status.keys()))
         with self._rel_lock:
             self._rel_processed += 1
+            self._rel_last_valid = time.monotonic()
             if usable:
                 self._rel_last_telemetry = time.monotonic()
         if usable:
@@ -351,6 +390,10 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_covered = set()
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
+                # A new connection may be answered where the last one was not.
+                self._rel_full_unanswered = 0
+                self._rel_last_pushall_req = 0.0
+                self._rel_subscription = "pending"
             if down_since is not None:
                 log.warning("ReliablePrinter: MQTT reconnected after %.0fs", time.monotonic() - down_since)
             if self.service_state != ServiceState.PAUSED:
@@ -373,6 +416,14 @@ class ReliablePrinter(BambuPrinter):
             original(client, userdata, flags, reason_code, properties)
         return on_disconnect
 
+    def _on_subscribe(self, client, userdata, mid, reason_code_list, properties):
+        refused = [rc for rc in reason_code_list or () if getattr(rc, "is_failure", False)]
+        with self._rel_lock:
+            self._rel_subscription = f"refused ({refused[0]})" if refused else "granted"
+        if refused:
+            log.warning("ReliablePrinter: printer refused the report subscription (%s); no report can arrive",
+                        refused[0])
+
     def _rel_set_connect_error(self, message: str) -> None:
         with self._rel_lock:
             changed = message != self._rel_connect_error
@@ -385,19 +436,61 @@ class ReliablePrinter(BambuPrinter):
         with self._rel_lock:
             return self._rel_nozzle
 
+    def _rel_full_state_wait(self, now: float) -> float:
+        """Seconds until another full-state request may be sent (caller holds _rel_lock)."""
+        n = self._rel_full_unanswered
+        gap = 0.0 if n == 0 else min(PUSHALL_MAX_S, PUSHALL_EVERY_S * 2 ** (n - 1))
+        return max(0.0, self._rel_last_pushall_req + gap - now)
+
+    def _rel_full_state_slot(self) -> bool:
+        """Claim the next full-state request. The first on a connection, or the first after a full
+        report, goes at once; while requests stay unanswered the gap doubles up to PUSHALL_MAX_S."""
+        now = time.monotonic()
+        with self._rel_lock:
+            if self._rel_full_state_wait(now) > 0:
+                return False
+            self._rel_last_pushall_req = now
+            self._rel_full_requests += 1
+            self._rel_full_unanswered += 1
+            return True
+
     def _request_pushall(self, client=None) -> bool:
-        """Read-only full-state request. Safe to repeat; never a printer write."""
+        """Read-only full-state request, within the shared back-off. Never a printer write.
+
+        After an unanswered request it also asks the printer to start streaming reports, which a
+        printer that stopped pushing needs and one that is pushing ignores."""
         client = client or self._client
         if client is None:
             return False
         try:
             if not client.is_connected():
                 return False
-            self._rel_last_pushall_req = time.monotonic()
-            client.publish(f"device/{self.config.serial_number}/request", json.dumps(ANNOUNCE_PUSH))
+            with self._rel_lock:
+                unanswered = self._rel_full_unanswered
+            if not self._rel_full_state_slot():
+                return False
+            topic = f"device/{self.config.serial_number}/request"
+            if unanswered:
+                client.publish(topic, json.dumps(REQUEST_PUSH_START))
+            client.publish(topic, json.dumps(ANNOUNCE_PUSH))
             return True
         except Exception as exc:
             log.debug("ReliablePrinter: pushall request failed: %s", exc)
+            return False
+
+    def _request_version(self) -> bool:
+        """Read-only get_version, at most every PUSHALL_EVERY_S. Its reply shows the printer still
+        answers on this connection when it sends no report."""
+        client = self._client
+        now = time.monotonic()
+        try:
+            if client is None or not client.is_connected() or now - self._rel_last_version_req < PUSHALL_EVERY_S:
+                return False
+            self._rel_last_version_req = now
+            client.publish(f"device/{self.config.serial_number}/request", json.dumps(ANNOUNCE_VERSION))
+            return True
+        except Exception as exc:
+            log.debug("ReliablePrinter: version request failed: %s", exc)
             return False
 
     # ── paho client proxy ────────────────────────────────────────────────────
@@ -579,6 +672,12 @@ class ReliablePrinter(BambuPrinter):
         # No thread yet, or assigned but not yet started (bpm assigns before .start()).
         return self.service_state == ServiceState.QUIT
 
+    @staticmethod
+    def _quiet_detail(answering: bool, last_valid: float | None, now: float, unanswered: int) -> str:
+        who = (f"the printer answers requests (last message {now - last_valid:.0f}s ago) but sends no status report"
+               if answering else "nothing well-formed received from the printer on this connection")
+        return f"{who}; {unanswered} full-state request(s) unanswered"
+
     def health_snapshot(self) -> dict:
         now = time.monotonic()
 
@@ -590,9 +689,16 @@ class ReliablePrinter(BambuPrinter):
             last_tel = self._rel_last_telemetry
             baseline = self._rel_baseline_at
             in_msg = self._rel_in_message_since
+            last_valid = self._rel_last_valid
+            subscription = self._rel_subscription
+            unanswered = self._rel_full_unanswered
+            # Answering: something well-formed arrived on this connection within the dead-link window.
+            answering = (connected_at is not None and last_valid is not None and last_valid >= connected_at
+                         and now - last_valid <= FORCE_RECONNECT_AFTER_S)
             snap = {
                 "age_s": {
                     "last_received": age(self._rel_last_received),
+                    "last_valid": age(last_valid),
                     "last_telemetry": age(last_tel),
                     "last_usable": age(self._rel_last_usable),
                     "baseline": age(baseline),
@@ -601,6 +707,12 @@ class ReliablePrinter(BambuPrinter):
                 },
                 "messages": {"received": self._rel_received, "processed": self._rel_processed,
                              "failed": self._rel_failed},
+                "printer_answering": answering,
+                "report_subscription": subscription,
+                "full_state": {"requests": self._rel_full_requests, "unanswered": unanswered,
+                               "last_request": age(self._rel_last_pushall_req or None),
+                               "last_full_report": age(self._rel_last_full_report),
+                               "next_request_in_s": round(self._rel_full_state_wait(now), 1)},
                 "last_error": self._rel_last_error,
                 "connect_error": self._rel_connect_error,
                 "session_generation": self._rel_generation,
@@ -636,13 +748,19 @@ class ReliablePrinter(BambuPrinter):
                 status, reason = "disconnected", "MQTT reconnecting" + (
                     f"; last attempt: {connect_error}" if connect_error
                     else f"; {self._rel_last_error}" if self._rel_last_error else "")
+        elif subscription and subscription.startswith("refused"):
+            status, reason = "stale", f"report subscription {subscription}; no report can arrive on this connection"
         elif baseline is None:
             if self._rel_failed and self._rel_last_error and "processing failed" in self._rel_last_error:
                 status, reason = "incomplete", self._rel_last_error
-            else:
+            elif now - connected_at <= STALE_AFTER_S:
                 status, reason = "starting", "waiting for a full state report since (re)connect"
+            else:
+                status, reason = "stale", (f"MQTT connected for {now - connected_at:.0f}s with no full status "
+                                           "report since (re)connect; " + self._quiet_detail(answering, last_valid, now, unanswered))
         elif last_tel is None or now - last_tel > STALE_AFTER_S:
-            status, reason = "stale", f"no telemetry processed for {age(last_tel)}s"
+            status, reason = "stale", (f"no telemetry processed for {age(last_tel)}s; "
+                                       + self._quiet_detail(answering, last_valid, now, unanswered))
         else:
             status, reason = "live", "telemetry current"
         snap.update({"status": status, "reason": reason, "live": status == "live"})
@@ -771,7 +889,8 @@ class _Supervisor:
         with self._lock:
             return self._info.setdefault(name, {"failures": 0, "restarts": 0, "next_restart": 0.0,
                                                 "stuck_since": None, "reconnect_requested": None,
-                                                "live_since": None, "last_restart_reason": None})
+                                                "live_since": None, "last_restart_reason": None,
+                                                "quiet_replacements": 0})
 
     def _check(self, manager, name: str) -> None:
         now = time.monotonic()
@@ -793,8 +912,9 @@ class _Supervisor:
             e["reconnect_requested"] = None
             if e["live_since"] is None:
                 e["live_since"] = now
-            elif e["failures"] and now - e["live_since"] > BACKOFF_RESET_AFTER_LIVE_S:
+            elif now - e["live_since"] > BACKOFF_RESET_AFTER_LIVE_S:
                 e["failures"] = 0
+                e["quiet_replacements"] = 0
             return
         e["live_since"] = None
         if status == "paused":
@@ -814,20 +934,34 @@ class _Supervisor:
             return
         if status == "disconnected":
             return  # paho is reconnecting on its own (bounded 1..30s backoff)
-        # connected: starting / incomplete / stale
-        if now - p._rel_last_pushall_req > PUSHALL_EVERY_S:
-            p._request_pushall()
+        # connected: starting / incomplete / stale. Both requests are read-only and rate-limited by
+        # ReliablePrinter; the version reply shows whether the printer still answers.
+        p._request_version()
+        p._request_pushall()
         # Quiet = no usable, complete telemetry this connection. Received-but-useless frames
         # (malformed, partial, command replies) do not count, or a flood would hold it off forever.
         usable_for = h["age_s"]["last_usable"]
         connected_for = h["age_s"]["connected_for"] or 0.0
         silent = connected_for if usable_for is None else min(usable_for, connected_for)
-        if silent > FORCE_RECONNECT_AFTER_S and connected_for > FORCE_RECONNECT_AFTER_S:
+        # Nothing well-formed arrives: a dead or corrupted link, replaced after FORCE_RECONNECT_AFTER_S.
+        # The printer answers but does not report: a new connection was not seen to help (2026-11-03,
+        # 39 of them), so replace it only on a doubling schedule kept per printer across sessions.
+        answering = h.get("printer_answering")
+        limit = (min(NO_REPORT_RECONNECT_MAX_S, NO_REPORT_RECONNECT_S * 2 ** e["quiet_replacements"])
+                 if answering else FORCE_RECONNECT_AFTER_S)
+        if silent > limit and connected_for > limit:
             requested = e["reconnect_requested"]
             if requested is None or requested[0] is not p:  # per session, never inherited
                 e["reconnect_requested"] = (p, now)
-                log.warning("supervisor: %s connected without usable telemetry for %.0fs; dropping the connection",
-                            name, silent)
+                if answering:
+                    e["quiet_replacements"] += 1
+                    log.warning("supervisor: %s answers but sent no usable telemetry for %.0fs; replacing the "
+                                "connection (replacement %d; next no sooner than %.0fs)", name, silent,
+                                e["quiet_replacements"],
+                                min(NO_REPORT_RECONNECT_MAX_S, NO_REPORT_RECONNECT_S * 2 ** e["quiet_replacements"]))
+                else:
+                    log.warning("supervisor: %s connected without usable telemetry or any well-formed message "
+                                "for %.0fs; dropping the connection", name, silent)
                 try:
                     p._client.disconnect()  # loop_forever returns; the dead thread is then restarted
                 except Exception as exc:

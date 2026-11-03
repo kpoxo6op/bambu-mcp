@@ -460,11 +460,16 @@ def get_printer_connection_status(name: str) -> dict:
 
         ``live`` / ``telemetry`` are the authoritative freshness answer (reliability.health):
         ``telemetry.status`` is one of live, starting, incomplete, stale, disconnected, recovering,
-        stuck, paused, not_connected, unknown, with ``reason``, ``age_s`` (last_received,
+        stuck, paused, not_connected, unknown, with ``reason``, ``age_s`` (last_received, last_valid,
         last_telemetry, last_usable, baseline, connected_for, in_callback_for), message counters, restarts,
         ``connect_error`` (why the latest connection attempt failed: printer unreachable, connection
         refused, or "Not authorized" for a rejected LAN access code; None once connected) and
-        ``writable``. Printer writes are refused unless ``writable`` is True; state tools return
+        ``writable``. ``starting`` lasts only a short grace after a (re)connect; a connection
+        without a full status report after that is ``stale``, and ``reason`` says whether the
+        printer still answers requests. ``printer_answering`` is True while well-formed messages
+        (replies included) arrive on this connection. ``report_subscription`` is pending, granted
+        or refused. ``full_state`` counts full-state requests on this connection: ``unanswered``
+        since the last full report, and ``next_request_in_s`` (the gap doubles while unanswered). Printer writes are refused unless ``writable`` is True; state tools return
         ``{"error": "telemetry_not_live", "last_known": ...}`` unless ``live`` is True.
     """
     log.debug("get_printer_connection_status: called for name=%s", name)
