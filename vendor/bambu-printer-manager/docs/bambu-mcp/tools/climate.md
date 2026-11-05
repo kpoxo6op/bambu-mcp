@@ -2,16 +2,19 @@
 
 # Climate
 
-7 tools, defined in [`tools/climate.py`](https://github.com/synman/bambu-mcp/blob/main/tools/climate.py).
+10 tools, defined in [`tools/climate.py`](https://github.com/synman/bambu-mcp/blob/main/tools/climate.py).
 
 | Tool | Title | Access |
 |---|---|---|
 | [`get_chamber_light`](#get_chamber_light) | Get Chamber Light State | read-only |
 | [`get_climate`](#get_climate) | Get Climate Status | read-only |
+| [`get_night_light_policy`](#get_night_light_policy) | Get Night Light Policy | read-only |
+| [`light_inspection_lease`](#light_inspection_lease) | Light Inspection Lease | write |
 | [`set_bed_temp`](#set_bed_temp) | Set Bed Temperature | write |
 | [`set_chamber_light`](#set_chamber_light) | Set Chamber Light | write |
 | [`set_chamber_temp`](#set_chamber_temp) | Set Chamber Temperature | write |
 | [`set_fan_speed`](#set_fan_speed) | Set Fan Speed | write |
+| [`set_night_light_policy`](#set_night_light_policy) | Set Night Light Policy | write |
 | [`set_nozzle_temp`](#set_nozzle_temp) | Set Nozzle Temperature | write |
 
 ## get_chamber_light
@@ -79,6 +82,68 @@ COOL_MODE is 0 (falsy). ``"NOT_SUPPORTED"`` therefore cannot tell a printer with
 no chamber AC from one in cool mode, including right after ``set_chamber_temp``
 below 40°C. Only ``"HEAT_MODE"`` is reliably reported by name.
 ``{"error": str}`` when the printer is not connected.
+
+## get_night_light_policy
+
+**Get Night Light Policy** · read-only
+
+Return the chamber-light quiet-hours policy of the named printer and what it last did.
+
+**WHEN to use:** check that quiet hours are enabled, whether they apply now, the reported
+light state, any inspection lease and the server's last automatic OFF command.
+
+**Sibling disambiguation:** ``set_night_light_policy`` changes the policy;
+``get_chamber_light`` reads bpm's light flag, which reads False before any report.
+
+**Parameters**
+
+- `name` (string, required): Configured printer name (see ``get_configured_printers``).
+
+**Returns**
+
+``{policy: {enabled, timezone, start, end} | None, quiet_now, local_time,
+next_quiet_start, next_quiet_end, light: {reported: "on"|"off"|"unknown", age_s},
+telemetry: {status, writable}, lease: {until, due, restore} | None, last_action:
+{at, command, reason, result} | None, off_commands_since_reported_off}``.
+``light.reported`` is ``"unknown"`` until the printer reports its lights on the
+current connection. ``error`` is present when the stored policy file is unreadable
+(no policy is applied then).
+
+## light_inspection_lease
+
+**Light Inspection Lease** · write · needs `user_permission=True`
+
+Switch the chamber light on for a bounded inspection; the server switches it off after.
+
+**WHEN to use:** light the chamber briefly for a camera capture or a look; the server sends
+the OFF even if the capture or the caller fails. Call with ``seconds`` 0 when done.
+
+**WRITE GUARD:** when the printer reports the light off, persists the deadline and then
+sends the same ON command as ``set_chamber_light``. At the deadline, also after a server
+restart, the server sends OFF whether or not the ON was reported, but only while telemetry
+is writable (a printer offline then gets it when it is back). The lease ends only when a
+report newer than that OFF says off; until then the OFF repeats on a doubling back-off,
+and an unproven lease is dropped 6 h after its deadline. A light already on
+is left alone with no lease, so a manual ON is never switched off. Quiet hours take
+precedence: a lease is refused inside them and ends at the next quiet-hours start. With
+``user_permission`` False nothing is stored or sent.
+
+**Sibling disambiguation:** ``set_chamber_light`` switches the light with no automatic
+OFF; ``set_night_light_policy`` keeps it off at night.
+
+**Parameters**
+
+- `name` (string, required): Configured printer name (see ``get_configured_printers``).
+- `seconds` (integer, required): Lease length, 1 to 900. A repeat while a lease runs extends it. 0 ends the current lease now (the OFF follows from the server, not from this call).
+- `user_permission` (boolean, default `false`): Must be True to execute. Default False.
+
+**Returns**
+
+``{lease_until, seconds, restore, sent}``: ``sent`` True when an ON was sent.
+``{lease: None, sent: False, light: "on", detail}`` when the light was already on.
+``{ended, detail}`` for ``seconds`` 0. ``{error, sent: False, detail}`` with error
+``quiet_hours``, ``not_connected`` or ``light_unknown`` (not reported as on or off on
+this connection); ``{"error": str}`` for a refused permission or invalid ``seconds``.
 
 ## set_bed_temp
 
@@ -234,6 +299,44 @@ A ``str``. Success: ``"<fan> fan set to <speed_percent>% on '<name>'."``. Errors
 
 These fan controls send M106 G-code commands internally. Fan speed set here may be
 overridden by the active print job's slicer settings.
+
+## set_night_light_policy
+
+**Set Night Light Policy** · write · needs `user_permission=True`
+
+Enable or disable quiet hours for the chamber light of the named printer.
+
+**WHEN to use:** have the server itself keep the chamber light off at night, without an
+agent or a person switching it off. The setting persists across server restarts.
+
+**WRITE GUARD:** changes only this server's stored per-printer policy; nothing is sent to
+the printer by this call. Once enabled, the server sends the same OFF command as
+``set_chamber_light`` whenever, inside the window, the printer reports its chamber light
+on: at the window start, after a server start or reconnect inside it, and after the
+light is switched on during it by the firmware, a person or another tool. It never
+switches the light on, never touches a print, heater or setting, sends nothing while
+telemetry is stale or the light has not been reported, and repeats an OFF only after a
+newer report still says on, with a doubling back-off. With ``user_permission`` False
+nothing is stored.
+
+**Sibling disambiguation:** ``get_night_light_policy`` reads the policy and what it last
+did; ``light_inspection_lease`` switches the light on briefly with an automatic OFF;
+``set_chamber_light`` switches the light once.
+
+**Parameters**
+
+- `name` (string, required): Configured printer name (see ``get_configured_printers``).
+- `enabled` (boolean, required): True to enforce quiet hours, False to stop (the hours are kept).
+- `timezone` (string, default `""`): IANA zone name for the hours, for example ``"Europe/Berlin"``. Required when enabling; local wall-clock time follows its daylight-saving changes.
+- `start` (string, default `"22:00"`): Quiet hours start, ``"HH:MM"`` 24-hour local time. Default ``"22:00"``.
+- `end` (string, default `"07:00"`): Quiet hours end, ``"HH:MM"``; may be earlier than start (window crosses midnight). Must differ from start. Default ``"07:00"``.
+- `user_permission` (boolean, default `false`): Must be True to store the policy. Default False.
+
+**Returns**
+
+The ``get_night_light_policy`` result after the change. ``{"error": str}`` when
+``user_permission`` is False, the printer is not configured, or an argument is
+invalid (unknown zone, malformed hour, equal start and end); nothing is stored then.
 
 ## set_nozzle_temp
 

@@ -126,6 +126,19 @@ Replay a failure:
   replayed id, a card that already has a record and a job in progress write nothing. The registered
   record is written once over the server's FTPS session; an upload binds it, a start is refused when
   the card fills, then one start reaches the wire.
+* Chamber light quiet hours (`docs/night-light.md`). The simulated printer reports `lights_report`
+  and acts on `ledctrl`; the server's wall clock is an epoch the campaign writes (the fixture
+  reads it; the controller's own timer and back-off are shortened). Policies with an unknown zone,
+  malformed or equal hours, or without permission store nothing. Inside quiet hours an unreported
+  light gets no command; a light on at 21:59:50 and at 21:30 in June (NZST; a fixed +13 offset
+  would say 22:30) stays on; exactly one OFF arrives at 22:00 NZDT and nothing more while it is
+  reported off. A light switched on during the night goes off once; a printer that ignores the
+  OFF gets none while telemetry is stale and, once live, repeats only on the doubling back-off.
+  After a SIGKILL with the light switched on meanwhile, the stored policy is restored and the
+  light goes off after the reconnect. Nothing is switched on at 07:00. An inspection lease is
+  refused in quiet hours, returns the light off at its deadline when the caller never ends it and
+  when the server is killed and restarted past it, gives no lease to a light already on (which
+  stays on), and is cut at the next quiet-hours start. Disabled quiet hours send nothing.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.

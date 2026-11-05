@@ -179,6 +179,8 @@ Manage the heated components: nozzle (melts filament, ~200–300°C), bed (build
 ### Climate (tools/climate.py) — REQUIRE user_permission=True
 - set_nozzle_temp(name, temp, extruder?) / set_bed_temp(name, temp) / set_chamber_temp(name, temp)
 - set_chamber_light(name, on) / get_chamber_light(name) — chamber lighting
+- set_night_light_policy(name, enabled, timezone, start, end) / get_night_light_policy(name) — server-enforced chamber light quiet hours
+- light_inspection_lease(name, seconds) — light the chamber briefly; the server switches it off at the deadline
 - get_climate(name) — current temperatures + chamber door state
 - set_fan_speed(name, fan, speed_percent) — fan must be 'part_cooling', 'aux', or 'exhaust'; 0–100%
   Note: fan speed may be overridden by the active print job slicer settings

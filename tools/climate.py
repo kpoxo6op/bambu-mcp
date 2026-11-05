@@ -364,6 +364,134 @@ def get_chamber_light(name: str) -> dict:
         return {"error": str(e)}
 
 
+def set_night_light_policy(
+    name: str,
+    enabled: bool,
+    timezone: str = "",
+    start: str = "22:00",
+    end: str = "07:00",
+    user_permission: bool = False,
+) -> dict:
+    """
+    Enable or disable quiet hours for the chamber light of the named printer.
+
+    WHEN to use: have the server itself keep the chamber light off at night, without an
+    agent or a person switching it off. The setting persists across server restarts.
+
+    WRITE GUARD: changes only this server's stored per-printer policy; nothing is sent to
+    the printer by this call. Once enabled, the server sends the same OFF command as
+    ``set_chamber_light`` whenever, inside the window, the printer reports its chamber light
+    on: at the window start, after a server start or reconnect inside it, and after the
+    light is switched on during it by the firmware, a person or another tool. It never
+    switches the light on, never touches a print, heater or setting, sends nothing while
+    telemetry is stale or the light has not been reported, and repeats an OFF only after a
+    newer report still says on, with a doubling back-off. With ``user_permission`` False
+    nothing is stored.
+
+    Sibling disambiguation: ``get_night_light_policy`` reads the policy and what it last
+    did; ``light_inspection_lease`` switches the light on briefly with an automatic OFF;
+    ``set_chamber_light`` switches the light once.
+
+    Args:
+        name: Configured printer name (see ``get_configured_printers``).
+        enabled: True to enforce quiet hours, False to stop (the hours are kept).
+        timezone: IANA zone name for the hours, for example ``"Europe/Berlin"``. Required
+            when enabling; local wall-clock time follows its daylight-saving changes.
+        start: Quiet hours start, ``"HH:MM"`` 24-hour local time. Default ``"22:00"``.
+        end: Quiet hours end, ``"HH:MM"``; may be earlier than start (window crosses
+            midnight). Must differ from start. Default ``"07:00"``.
+        user_permission: Must be True to store the policy. Default False.
+
+    Returns:
+        The ``get_night_light_policy`` result after the change. ``{"error": str}`` when
+        ``user_permission`` is False, the printer is not configured, or an argument is
+        invalid (unknown zone, malformed hour, equal start and end); nothing is stored then.
+    """
+    log.debug("set_night_light_policy: called for name=%s enabled=%s tz=%s %s-%s user_permission=%s",
+              name, enabled, timezone, start, end, user_permission)
+    if not user_permission:
+        return {"error": _permission_denied("This would store quiet hours that switch the chamber light off.")}
+    import night_light
+    try:
+        return night_light.controller.set_policy(name, enabled, timezone, start, end)
+    except ValueError as e:
+        return {"error": f"{e}; nothing stored"}
+
+
+def get_night_light_policy(name: str) -> dict:
+    """
+    Return the chamber-light quiet-hours policy of the named printer and what it last did.
+
+    WHEN to use: check that quiet hours are enabled, whether they apply now, the reported
+    light state, any inspection lease and the server's last automatic OFF command.
+
+    Sibling disambiguation: ``set_night_light_policy`` changes the policy;
+    ``get_chamber_light`` reads bpm's light flag, which reads False before any report.
+
+    Args:
+        name: Configured printer name (see ``get_configured_printers``).
+
+    Returns:
+        ``{policy: {enabled, timezone, start, end} | None, quiet_now, local_time,
+        next_quiet_start, next_quiet_end, light: {reported: "on"|"off"|"unknown", age_s},
+        telemetry: {status, writable}, lease: {until, due, restore} | None, last_action:
+        {at, command, reason, result} | None, off_commands_since_reported_off}``.
+        ``light.reported`` is ``"unknown"`` until the printer reports its lights on the
+        current connection. ``error`` is present when the stored policy file is unreadable
+        (no policy is applied then).
+    """
+    import night_light
+    return night_light.controller.status(name)
+
+
+def light_inspection_lease(
+    name: str,
+    seconds: int,
+    user_permission: bool = False,
+) -> dict:
+    """
+    Switch the chamber light on for a bounded inspection; the server switches it off after.
+
+    WHEN to use: light the chamber briefly for a camera capture or a look; the server sends
+    the OFF even if the capture or the caller fails. Call with ``seconds`` 0 when done.
+
+    WRITE GUARD: when the printer reports the light off, persists the deadline and then
+    sends the same ON command as ``set_chamber_light``. At the deadline, also after a server
+    restart, the server sends OFF whether or not the ON was reported, but only while telemetry
+    is writable (a printer offline then gets it when it is back). The lease ends only when a
+    report newer than that OFF says off; until then the OFF repeats on a doubling back-off,
+    and an unproven lease is dropped 6 h after its deadline. A light already on
+    is left alone with no lease, so a manual ON is never switched off. Quiet hours take
+    precedence: a lease is refused inside them and ends at the next quiet-hours start. With
+    ``user_permission`` False nothing is stored or sent.
+
+    Sibling disambiguation: ``set_chamber_light`` switches the light with no automatic
+    OFF; ``set_night_light_policy`` keeps it off at night.
+
+    Args:
+        name: Configured printer name (see ``get_configured_printers``).
+        seconds: Lease length, 1 to 900. A repeat while a lease runs extends it. 0 ends the
+            current lease now (the OFF follows from the server, not from this call).
+        user_permission: Must be True to execute. Default False.
+
+    Returns:
+        ``{lease_until, seconds, restore, sent}``: ``sent`` True when an ON was sent.
+        ``{lease: None, sent: False, light: "on", detail}`` when the light was already on.
+        ``{ended, detail}`` for ``seconds`` 0. ``{error, sent: False, detail}`` with error
+        ``quiet_hours``, ``not_connected`` or ``light_unknown`` (not reported as on or off on
+        this connection); ``{"error": str}`` for a refused permission or invalid ``seconds``.
+    """
+    log.debug("light_inspection_lease: called for name=%s seconds=%s user_permission=%s",
+              name, seconds, user_permission)
+    if not user_permission:
+        return {"error": _permission_denied("This would switch the chamber light on until a deadline.")}
+    import night_light
+    try:
+        return night_light.controller.grant_lease(name, seconds)
+    except ValueError as e:
+        return {"error": f"{e}; nothing sent"}
+
+
 def set_fan_speed(
     name: str,
     fan: str,

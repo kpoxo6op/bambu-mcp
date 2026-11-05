@@ -54,13 +54,13 @@ not assign a new license to upstream code that did not ship one.
 ## Tools
 
 <!-- gen_docs:tools:begin -->
-107 tools (52 read-only, 55 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
+110 tools (53 read-only, 57 write) and 87 REST routes. Full reference: [bambu-mcp docs](https://synman.github.io/bambu-printer-manager/bambu-mcp/).
 
 | Category | Tools |
 |---|---|
 | [Printer State](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/state/) | `get_ams_status`, `get_capabilities`, `get_fan_speeds`, `get_hms_errors`, `get_job_info`, `get_print_progress`, `get_printer_info`, `get_printer_state`, `get_spool_info`, `get_temperatures`, `get_wifi_signal` |
 | [Print Control](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/print-control/) | `clear_print_error`, `pause_print`, `resume_print`, `select_extrusion_calibration`, `send_gcode`, `set_print_option`, `set_print_speed`, `skip_objects`, `stop_print` |
-| [Climate](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/climate/) | `get_chamber_light`, `get_climate`, `set_bed_temp`, `set_chamber_light`, `set_chamber_temp`, `set_fan_speed`, `set_nozzle_temp` |
+| [Climate](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/climate/) | `get_chamber_light`, `get_climate`, `get_night_light_policy`, `light_inspection_lease`, `set_bed_temp`, `set_chamber_light`, `set_chamber_temp`, `set_fan_speed`, `set_night_light_policy`, `set_nozzle_temp` |
 | [Filament & AMS](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/filament/) | `calibrate_ams_remaining`, `get_ams_units`, `get_external_spool`, `get_filament_catalog`, `load_filament`, `send_ams_control_command`, `set_ams_filament_setting`, `set_ams_user_setting`, `start_ams_dryer`, `stop_ams_dryer`, `unload_filament` |
 | [Nozzles](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/nozzle/) | `get_nozzle_info`, `refresh_nozzles`, `set_nozzle_config`, `swap_tool` |
 | [Detectors](https://synman.github.io/bambu-printer-manager/bambu-mcp/tools/detectors/) | `get_detector_settings`, `set_air_printing_detection`, `set_buildplate_marker_detection`, `set_first_layer_inspection`, `set_nozzle_clumping_detection`, `set_purge_chute_detection`, `set_spaghetti_detection` |

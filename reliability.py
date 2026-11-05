@@ -159,6 +159,22 @@ def _external_free_bytes(status: dict) -> int | None:
     return None
 
 
+def _chamber_light_mode(status: dict) -> str | None:
+    """The chamber_light node's mode in a lights_report (first node if none is named so), or None.
+
+    Only "on" and "off" are taken as such; any other mode is "unknown", never a stand-in for off.
+    """
+    nodes = status.get("lights_report")
+    if not isinstance(nodes, list):
+        return None
+    nodes = [n for n in nodes if isinstance(n, dict) and "mode" in n]
+    named = [n for n in nodes if n.get("node") == "chamber_light"]
+    if not (named or nodes):
+        return None
+    mode = (named or nodes)[0]["mode"]
+    return mode if mode in ("on", "off") else "unknown"
+
+
 def _in_mqtt_callback() -> bool:
     return bool(getattr(_tls, "in_message", False))
 
@@ -354,6 +370,10 @@ class ReliablePrinter(BambuPrinter):
         # as reported on this connection; never carried across a reconnect (the card may change).
         self._rel_sd: tuple[int, str, float] | None = None
         self._rel_ext_free: int | None = None
+        # Chamber light mode and monotonic time of the last lights_report on this connection. None
+        # until one arrives: bpm's light_state reads False before any report, which is not "off".
+        # Never carried across a reconnect (the light may change while the link is down).
+        self._rel_light: tuple[str, float] | None = None
 
     def _rel_mark_incomplete(self, why: str) -> None:
         with self._rel_lock:
@@ -369,8 +389,10 @@ class ReliablePrinter(BambuPrinter):
             keys.add("bed")
         if "nozzle_temper" in status or "device" in status:
             keys.add("nozzle")
-        sd, free = _sd_card_state(status), _external_free_bytes(status)
+        sd, free, light = _sd_card_state(status), _external_free_bytes(status), _chamber_light_mode(status)
         with self._rel_lock:
+            if light is not None:
+                self._rel_light = (light, time.monotonic())
             if "nozzle_diameter" in status:
                 self._rel_nozzle = str(status["nozzle_diameter"])
             if sd is not None:
@@ -482,6 +504,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
                 self._rel_sd = self._rel_ext_free = None
+                self._rel_light = None
                 # A new connection may be answered where the last one was not.
                 self._rel_full_unanswered = 0
                 self._rel_last_pushall_req = 0.0
@@ -502,6 +525,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
                 self._rel_sd = self._rel_ext_free = None
+                self._rel_light = None
                 self._rel_last_error = f"mqtt disconnected: {reason_code}"
             if was_connected:  # once per lost connection, not per failed retry
                 log.warning("ReliablePrinter: MQTT disconnected (%s); telemetry not live until it reconnects",
@@ -538,6 +562,11 @@ class ReliablePrinter(BambuPrinter):
         """Free bytes of external storage as the firmware reported them on this connection, or None."""
         with self._rel_lock:
             return self._rel_ext_free
+
+    def reported_light(self) -> tuple[str, float] | None:
+        """(mode, monotonic time) of the chamber light as last reported on this connection, or None."""
+        with self._rel_lock:
+            return self._rel_light
 
     def _rel_full_state_wait(self, now: float) -> float:
         """Seconds until another full-state request may be sent (caller holds _rel_lock)."""

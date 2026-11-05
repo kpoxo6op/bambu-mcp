@@ -1,7 +1,9 @@
 """Production server entrypoint with accelerated recovery deadlines for E2E faults.
 
 Credentials/configuration, parser, tools and all transports are real. Only the
-time thresholds are shortened. Protocol faults come from the network peers.
+time thresholds are shortened, and the wall clock that places quiet hours reads the
+epoch the campaign writes to BAMBU_HARNESS_CLOCK_FILE (real time while it is absent).
+Protocol faults come from the network peers.
 """
 import os
 import sys
@@ -21,6 +23,18 @@ for key, value in dict(STALE_AFTER_S=1.2, PUSHALL_EVERY_S=.5,
                        STUCK_CALLBACK_S=2., STUCK_EXIT_AFTER_S=4.,
                        SUPERVISOR_DEAD_AFTER_S=3.).items():
     setattr(reliability, key, value)
+import night_light
+for key, value in dict(TICK_S=.2, MIN_GAP_S=.05, OFF_BACKOFF_MIN_S=.5, OFF_BACKOFF_MAX_S=2.).items():
+    setattr(night_light, key, value)
+_clock_file = os.environ.get("BAMBU_HARNESS_CLOCK_FILE")
+if _clock_file:
+    import time
+    def _harness_clock():
+        try:
+            return float(Path(_clock_file).read_text())
+        except (OSError, ValueError):
+            return time.time()
+    night_light._wall_clock = _harness_clock
 # bpm's own watchdog asks for full state after watchdog_timeout seconds without a message: 30 s,
 # equal to PUSHALL_EVERY_S in production. Keep that ratio so both request sources compete here
 # as they do on the live printer.

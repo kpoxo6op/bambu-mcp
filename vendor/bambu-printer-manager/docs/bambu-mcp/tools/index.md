@@ -2,9 +2,9 @@
 
 # MCP Tools
 
-bambu-mcp registers 107 tools. Each carries MCP annotations: a title and a read-only flag, plus destructive, idempotent and open-world hints.
+bambu-mcp registers 110 tools. Each carries MCP annotations: a title and a read-only flag, plus destructive, idempotent and open-world hints.
 
-51 of the 55 write tools refuse to act unless called with `user_permission=True`. Without it they change nothing and return a refusal naming the consequence. The rest need no permission because they change only the local server, not the printer: `prepare_print_job`, `set_user_pref`, `start_stream`, `stop_stream`. Tools that disturb a print also refuse while the printer is printing, whatever `user_permission` says.
+53 of the 57 write tools refuse to act unless called with `user_permission=True`. Without it they change nothing and return a refusal naming the consequence. The rest need no permission because they change only the local server, not the printer: `prepare_print_job`, `set_user_pref`, `start_stream`, `stop_stream`. Tools that disturb a print also refuse while the printer is printing, whatever `user_permission` says.
 
 Parameters, return shapes and notes below come from the tool docstrings the server sends to MCP clients.
 
@@ -14,7 +14,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 |---|---|---|
 | [Printer State](state.md) | 11 | 0 |
 | [Print Control](print-control.md) | 9 | 9 |
-| [Climate](climate.md) | 7 | 5 |
+| [Climate](climate.md) | 10 | 7 |
 | [Filament & AMS](filament.md) | 11 | 8 |
 | [Nozzles](nozzle.md) | 4 | 3 |
 | [Detectors](detectors.md) | 7 | 6 |
@@ -65,6 +65,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 | [`get_monitoring_data`](snapshots.md#get_monitoring_data) | Get Monitoring Data URL | Snapshots & Monitoring Data | read-only |
 | [`get_monitoring_history`](snapshots.md#get_monitoring_history) | Get Monitoring History URL | Snapshots & Monitoring Data | read-only |
 | [`get_monitoring_series`](snapshots.md#get_monitoring_series) | Get Monitoring Series URL | Snapshots & Monitoring Data | read-only |
+| [`get_night_light_policy`](climate.md#get_night_light_policy) | Get Night Light Policy | Climate | read-only |
 | [`get_nozzle_info`](nozzle.md#get_nozzle_info) | Get Nozzle Info | Nozzles | read-only |
 | [`get_pending_alerts`](notifications.md#get_pending_alerts) | Get Pending Alerts | Alerts | read-only |
 | [`get_plate_thumbnail`](files.md#get_plate_thumbnail) | Get Plate Thumbnail | Files | read-only |
@@ -82,6 +83,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 | [`get_temperatures`](state.md#get_temperatures) | Get Temperatures | Printer State | read-only |
 | [`get_user_pref`](system.md#get_user_pref) | Get Sticky Preference | System | read-only |
 | [`get_wifi_signal`](state.md#get_wifi_signal) | Get Wi-Fi Signal | Printer State | read-only |
+| [`light_inspection_lease`](climate.md#light_inspection_lease) | Light Inspection Lease | Climate | write |
 | [`list_sdcard_files`](files.md#list_sdcard_files) | List SD Card Files | Files | read-only |
 | [`load_filament`](filament.md#load_filament) | Load Filament | Filament & AMS | write |
 | [`open_charts`](charts.md#open_charts) | Open Telemetry Dashboard | Charts | read-only |
@@ -116,6 +118,7 @@ Parameters, return shapes and notes below come from the tool docstrings the serv
 | [`set_chamber_temp`](climate.md#set_chamber_temp) | Set Chamber Temperature | Climate | write |
 | [`set_fan_speed`](climate.md#set_fan_speed) | Set Fan Speed | Climate | write |
 | [`set_first_layer_inspection`](detectors.md#set_first_layer_inspection) | Set First Layer Inspection | Detectors | write |
+| [`set_night_light_policy`](climate.md#set_night_light_policy) | Set Night Light Policy | Climate | write |
 | [`set_nozzle_clumping_detection`](detectors.md#set_nozzle_clumping_detection) | Set Nozzle Clumping Detection | Detectors | write |
 | [`set_nozzle_config`](nozzle.md#set_nozzle_config) | Set Nozzle Config | Nozzles | write |
 | [`set_nozzle_temp`](climate.md#set_nozzle_temp) | Set Nozzle Temperature | Climate | write |

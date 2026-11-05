@@ -7,6 +7,7 @@ Seeds are recorded and replayable. No production credentials or printer address.
 import asyncio
 import base64
 import collections
+import datetime as dt
 import gzip
 import hashlib
 import json
@@ -103,6 +104,14 @@ class Broker:
         # SD card state in each status report, as a P1 sends it: the sdcard bool and home_flag
         # bits 8-9 (Bambu Studio DevStorage). None: neither field is sent.
         self.sd = "normal"
+        # Chamber light mode in each status report as lights_report, as a P1 sends it (None: not
+        # reported). A ledctrl for chamber_light changes it and the printer reports the change at
+        # once; ignore_light models a printer that does not act on the command, and withhold_light
+        # one that acts on it but whose reports carry no lights_report (QoS 0 feedback lost, deltas
+        # without the field) while it keeps reporting.
+        self.light = None
+        self.ignore_light = False
+        self.withhold_light = False
         self.attempts = 0
         self.refusals = 0
         # Peers whose link went dead: never read from or written to again, no PINGRESP.
@@ -188,9 +197,14 @@ class Broker:
                 present, code = {"absent": (False, 0), "normal": (True, 1), "abnormal": (True, 2),
                                  "read_only": (True, 3)}[self.sd]
                 data["print"].update(sdcard=present, home_flag=code << 8)
+            if self.light is not None and not self.withhold_light:
+                data["print"]["lights_report"] = self.lights()
         topic = f"device/{self.serial}/report".encode()
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send(peer, packet(0x30, len(topic).to_bytes(2, "big")+topic+body))
+
+    def lights(self):
+        return [{"node": "chamber_light", "mode": self.light}, {"node": "work_light", "mode": "flashing"}]
 
     def broadcast(self, data=None):
         for peer in list(self.peers - self.unsubscribed):
@@ -254,6 +268,11 @@ class Broker:
             self.received.append(msg)
             if peer in self.unsubscribed:
                 return False
+            led = msg.get("system", {})
+            if led.get("command") == "ledctrl" and led.get("led_node") == "chamber_light" and not self.ignore_light:
+                self.light = led.get("led_mode")
+                if not self.withhold_light:
+                    self.report(peer, {"print": {"command": "push_status", "lights_report": self.lights()}})
             if self.lease_s and msg.get("pushing", {}).get("command") == "start":
                 self.lease_until = time.monotonic() + self.lease_s
             if self.reports and msg.get("pushing", {}).get("command") == "pushall":
@@ -412,7 +431,7 @@ async def campaign(seed, cycles):
                    # The server runs this fixed process as its preparer, as it runs the real
                    # Soyrack preflight in production; see fixture_preparer.py for what it is not.
                    BAMBU_PREFLIGHT_COMMAND_JSON=json.dumps([sys.executable, str(ROOT/"harness/fixture_preparer.py")]),
-                   BAMBU_PREFLIGHT_TIMEOUT_S="3")
+                   BAMBU_PREFLIGHT_TIMEOUT_S="3", BAMBU_HARNESS_CLOCK_FILE=str(tmp/"clock"))
         store = tmp/"home"/".bambu-mcp"/"preflight"
         Path(env["HOME"]).mkdir()
         log = (tmp/"server.log").open("w+")
@@ -771,6 +790,352 @@ async def campaign(seed, cycles):
                     assert proc.pid != old_pid
                     events.append({"fault":"server-SIGKILL-same-MCP-client",
                                    "recovery_s":round(time.monotonic()-start,3),"replayed":0})
+                    async def replace_server(old, server_env):
+                        old.kill(); old.wait(timeout=5)
+                        for _ in range(100):
+                            if not broker.peers:
+                                break
+                            await asyncio.sleep(.02)
+                        assert not broker.peers, "dead server still owns MQTT socket"
+                        new = subprocess.Popen([sys.executable, str(ROOT/"harness/fixture_server.py")],
+                                               env=server_env, cwd=ROOT, stdout=log, stderr=log)
+                        for _ in range(100):
+                            assert new.poll() is None, "replacement fixture died"
+                            try:
+                                probe = socket.create_connection(("127.0.0.1", port), .1)
+                                probe.close(); break
+                            except OSError:
+                                await asyncio.sleep(.1)
+                        await until_live()
+                        assert broker.maximum == 1, broker.maximum
+                        return new
+                    # Quiet hours for the chamber light (night_light.py), driven by the server's own timer
+                    # and the printer's reports. The simulated printer reports lights_report and acts on
+                    # ledctrl; the server's wall clock is the epoch written to the clock file. Every
+                    # command counted here is a received MQTT packet. Auckland is UTC+13 in November
+                    # (NZDT) and UTC+12 in June (NZST): a fixed offset gets one of the two wrong.
+                    def clock(when):
+                        (tmp/"clock").write_text(str(dt.datetime.fromisoformat(when).timestamp()))
+                    def light_cmds():
+                        return [m["system"]["led_mode"] for m in broker.mutations()
+                                if m.get("system", {}).get("command") == "ledctrl"
+                                and m["system"].get("led_node") == "chamber_light"]
+                    async def eventually(check, what, timeout=5.):
+                        start = time.monotonic()
+                        while not check():
+                            if time.monotonic() - start > timeout:
+                                raise AssertionError(f"{what}: light={broker.light} cmds={light_cmds()}")
+                            await asyncio.sleep(.05)
+                    async def status():
+                        return await call("get_night_light_policy")
+                    async def reported(mode):
+                        for _ in range(60):
+                            if (await status())["light"]["reported"] == mode:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError(f"light not reported {mode}: {await status()}")
+                    async def lease_closed():  # closed once the server has seen the light reported off
+                        for _ in range(60):
+                            if (await status())["lease"] is None:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError(f"lease still open: {await status()}")
+                    pacing = {"on": True, "done": False}
+                    async def pace():  # a connected printer keeps reporting, as above
+                        while not pacing["done"]:
+                            if pacing["on"]:
+                                broker.broadcast()
+                            await asyncio.sleep(.25)
+                    pacer = asyncio.create_task(pace())
+                    expected = light_cmds()
+                    clock("2026-11-05T09:30:00+00:00")  # 22:30 NZDT
+                    st = await status()
+                    assert st["policy"] is None and st["light"]["reported"] == "unknown", st
+                    refused = await call("set_night_light_policy", enabled=True, timezone="Pacific/Auckland")
+                    assert "user_permission" in str(refused.get("error")), refused
+                    for bad in ({"timezone": "Mars/Olympus_Mons"}, {"timezone": ""},
+                                {"timezone": "Pacific/Auckland", "start": "24:00"},
+                                {"timezone": "Pacific/Auckland", "start": "7:00", "end": "22:00"},
+                                {"timezone": "Pacific/Auckland", "start": "07:00", "end": "07:00"}):
+                        refused = await call("set_night_light_policy", enabled=True, user_permission=True, **bad)
+                        assert "nothing stored" in str(refused.get("error")), (bad, refused)
+                    assert (await status())["policy"] is None
+                    st = await call("set_night_light_policy", enabled=True, timezone="Pacific/Auckland",
+                                    start="22:00", end="07:00", user_permission=True)
+                    assert st["policy"]["enabled"] and st["quiet_now"], st
+                    # Inside quiet hours with the light never reported: unknown, not off, nothing sent.
+                    await asyncio.sleep(1)
+                    st = await status()
+                    assert st["light"]["reported"] == "unknown" and st["last_action"] is None, st
+                    assert light_cmds() == expected, light_cmds()
+                    # A light switched on by hand in the evening stays on, in either season.
+                    broker.light = "on"
+                    clock("2026-11-05T08:59:50+00:00")  # 21:59:50 NZDT
+                    await reported("on")
+                    await asyncio.sleep(1)
+                    clock("2026-06-15T09:30:00+00:00")  # 21:30 NZST; 22:30 at a fixed +13
+                    await asyncio.sleep(1)
+                    st = await status()
+                    assert not st["quiet_now"] and st["light"]["reported"] == "on", st
+                    assert light_cmds() == expected and broker.light == "on", light_cmds()
+                    # The boundary: exactly one OFF, then nothing more for a light reported off.
+                    clock("2026-11-05T09:00:00+00:00")  # 22:00 NZDT
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off", "no OFF at 22:00")
+                    await asyncio.sleep(1.5)
+                    st = await status()
+                    assert light_cmds() == expected and st["light"]["reported"] == "off", (light_cmds(), st)
+                    assert st["last_action"]["reason"] == "quiet hours" and st["last_action"]["result"] == "sent", st
+                    events.append({"contract":"quiet hours switch the light off at the Auckland boundary (NZDT, "
+                                   "not NZST), never act on an unreported light, then send nothing", "sent":1})
+                    # Switched on during the night (firmware, a person, another tool): off again, once.
+                    broker.light = "on"
+                    broker.broadcast()
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off", "night ON kept")
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected, light_cmds()
+                    # A printer that ignores the command, then goes stale: nothing is sent while stale,
+                    # and fresh ON reports get repeats only on the doubling back-off.
+                    broker.ignore_light = True
+                    broker.light = "on"
+                    broker.broadcast()
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected, "no OFF for an ignored command")
+                    pacing["on"], broker.reports = False, False
+                    await health_until(lambda h: not h["live"], "telemetry stayed live without reports")
+                    await asyncio.sleep(2.5)
+                    st = await status()
+                    assert light_cmds() == expected and not st["telemetry"]["writable"], (light_cmds(), st)
+                    pacing["on"], broker.reports = True, True
+                    broker.broadcast()
+                    await until_live()
+                    await asyncio.sleep(3)
+                    repeats = len(light_cmds()) - len(expected)
+                    # ~12 fresh ON reports arrived in that window; the back-off (0.5, 1, 2 s) allows 1-4 OFFs.
+                    assert 1 <= repeats <= 4 and set(light_cmds()[len(expected):]) == {"off"}, light_cmds()
+                    broker.ignore_light = False
+                    await eventually(lambda: broker.light == "off", "OFF not repeated after the back-off", 6)
+                    await asyncio.sleep(.5)
+                    expected = light_cmds()
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected, light_cmds()
+                    events.append({"contract":"night ON switched off again; stale telemetry sends nothing; an "
+                                   "ignored OFF repeats only on back-off", "repeats":repeats})
+                    # The server dies; the light is switched on while it is down. The stored policy is
+                    # restored at start and the light goes off after the reconnect.
+                    broker.light = "on"
+                    proc = await replace_server(proc, env)
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off",
+                                     "no catch-up OFF after restart")
+                    st = await status()
+                    assert st["policy"] == {"enabled": True, "timezone": "Pacific/Auckland",
+                                            "start": "22:00", "end": "07:00"}, st
+                    events.append({"contract":"policy survives a SIGKILL; light switched on while the server was "
+                                   "down goes off after reconnect", "sent":1})
+                    # Morning: nothing is switched on at the end of quiet hours.
+                    clock("2026-11-05T18:00:00+00:00")  # 07:00 NZDT
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected and broker.light == "off" and not (await status())["quiet_now"]
+                    # Inspection lease. Refused without permission, out of range and in quiet hours.
+                    clock("2026-11-05T09:30:00+00:00")
+                    refused = await call("light_inspection_lease", seconds=60, user_permission=True)
+                    assert refused.get("error") == "quiet_hours" and refused["sent"] is False, refused
+                    clock("2026-11-05T20:00:00+00:00")  # 09:00 NZDT
+                    refused = await call("light_inspection_lease", seconds=60)
+                    assert "user_permission" in str(refused.get("error")), refused
+                    refused = await call("light_inspection_lease", seconds=901, user_permission=True)
+                    assert "nothing sent" in str(refused.get("error")), refused
+                    assert light_cmds() == expected, light_cmds()
+                    # The caller lights the chamber and never ends the lease (its capture failed).
+                    lease = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    assert lease["sent"] is True and lease["seconds"] == 30, lease
+                    expected = expected + ["on"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "on", "lease ON")
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected, "light switched off before the deadline"
+                    clock("2026-11-05T20:00:31+00:00")
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off", "lease not ended")
+                    await lease_closed()
+                    # Again, and the server is SIGKILLed during the lease; it restarts past the deadline.
+                    lease = await call("light_inspection_lease", seconds=120, user_permission=True)
+                    expected = expected + ["on"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "on", "lease ON")
+                    old = proc
+                    old.kill(); old.wait(timeout=5)
+                    clock("2026-11-05T20:03:00+00:00")
+                    proc = await replace_server(old, env)
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off",
+                                     "lease deadline not enforced after restart")
+                    await lease_closed()
+                    # The printer acts on the lease's ON, but its reports, which keep telemetry live, carry
+                    # no lights_report: the server still holds the OFF reported before the ON. The deadline
+                    # sends the lease's own OFF anyway; that old OFF does not close it, a newer one does.
+                    def sent_after(n, mode):
+                        return len(light_cmds()) > n and set(light_cmds()[n:]) == {mode}
+                    broker.withhold_light = True
+                    lease = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    assert lease["sent"] is True, lease
+                    n = len(expected)
+                    await eventually(lambda: sent_after(n, "on") and broker.light == "on", "lease ON")
+                    assert (await status())["light"]["reported"] == "off"
+                    n = len(light_cmds())
+                    clock("2026-11-05T20:03:31+00:00")
+                    await eventually(lambda: sent_after(n, "off") and broker.light == "off",
+                                     "no lease OFF while the light report lags")
+                    await asyncio.sleep(1.5)
+                    st = await status()
+                    assert st["lease"] is not None and st["telemetry"]["writable"], st
+                    # The back-off (0.5, 1 s) allows at most 3 OFFs in this window, nothing else.
+                    assert sent_after(n, "off") and len(light_cmds()) - n <= 3, light_cmds()
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await lease_closed()
+                    expected = light_cmds()
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected and broker.light == "off", light_cmds()
+                    # A mode the server does not recognise is unknown: no lease on it, and after a lease's
+                    # OFF it is no proof of off.
+                    broker.light = "blinking"
+                    broker.broadcast()
+                    await reported("unknown")
+                    refused = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    assert refused.get("error") == "light_unknown" and refused["sent"] is False, refused
+                    broker.light = "off"
+                    broker.broadcast()
+                    await reported("off")
+                    lease = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    n = len(expected)
+                    await eventually(lambda: sent_after(n, "on") and broker.light == "on", "lease ON")
+                    await reported("on")
+                    broker.ignore_light = True
+                    broker.light = "blinking"
+                    broker.broadcast()
+                    await reported("unknown")
+                    n = len(light_cmds())
+                    clock("2026-11-05T20:04:02+00:00")
+                    await eventually(lambda: sent_after(n, "off"), "no lease OFF for an unknown mode")
+                    await asyncio.sleep(1)
+                    assert (await status())["lease"] is not None, "lease closed on a malformed mode"
+                    broker.ignore_light = False
+                    broker.light = "off"
+                    broker.broadcast()
+                    await lease_closed()
+                    # Lease ON with the feedback withheld; the link goes stale before the deadline and the
+                    # guard lets nothing out. The server is SIGKILLed and restarts past the deadline: the
+                    # light is unreported on the new connection and the persisted lease sends its OFF. A
+                    # late ON report keeps it open (OFF again on the back-off); a fresh OFF closes it.
+                    broker.withhold_light = True
+                    n = len(light_cmds())
+                    lease = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    await eventually(lambda: sent_after(n, "on") and broker.light == "on", "lease ON")
+                    n = len(light_cmds())
+                    pacing["on"], broker.reports = False, False
+                    await health_until(lambda h: not h["live"], "telemetry stayed live without reports")
+                    clock("2026-11-05T20:04:40+00:00")
+                    await asyncio.sleep(1.5)
+                    st = await status()
+                    assert len(light_cmds()) == n and broker.light == "on", light_cmds()
+                    assert st["lease"]["due"] and not st["telemetry"]["writable"], st
+                    old = proc
+                    old.kill(); old.wait(timeout=5)
+                    pacing["on"], broker.reports = True, True
+                    proc = await replace_server(old, env)
+                    await eventually(lambda: sent_after(n, "off") and broker.light == "off",
+                                     "persisted lease OFF not sent after restart")
+                    st = await status()
+                    assert st["lease"] is not None and st["light"]["reported"] == "unknown", st
+                    broker.broadcast({"print": {"command": "push_status",
+                                                "lights_report": [{"node": "chamber_light", "mode": "on"}]}})
+                    await reported("on")
+                    n = len(light_cmds())
+                    await eventually(lambda: sent_after(n, "off"), "late ON report not switched off", 6)
+                    assert (await status())["lease"] is not None
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await lease_closed()
+                    expected = light_cmds()
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected and broker.light == "off", light_cmds()
+                    events.append({"contract":"lease OFF at the deadline without an ON report; closed only by a "
+                                   "newer OFF report, not the cached one or a malformed mode; stale sends "
+                                   "nothing; persisted across SIGKILL; late ON switched off"})
+                    # paho reconnects the same session (no restart, no new manager) after a link drop, and
+                    # the light changes while the link is down. The new connection's reports keep telemetry
+                    # live but carry no lights_report: the light reported on the old connection is unknown
+                    # on the new one, whether it was off (no lease on it) or on (no night OFF on it).
+                    async def reconnect_unreported(light):
+                        before = (await call("get_printer_connection_status"))["telemetry"]
+                        connections = broker.connections
+                        broker.withhold_light = True
+                        broker.drop()
+                        broker.light = light
+                        await eventually(lambda: broker.connections > connections, "paho never reconnected")
+                        await until_live()
+                        after = (await call("get_printer_connection_status"))["telemetry"]
+                        assert (after["live"] and after["restarts"] == before["restarts"]
+                                and after["session_generation"] == before["session_generation"]
+                                and proc.poll() is None), (before, after)
+                        st = await status()
+                        assert st["light"]["reported"] == "unknown" and st["telemetry"]["writable"], st
+                    n = len(light_cmds())
+                    await reconnect_unreported("on")
+                    refused = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    assert refused.get("error") == "light_unknown" and refused["sent"] is False, refused
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await reported("on")
+                    await reconnect_unreported("off")
+                    clock("2026-11-05T09:30:00+00:00")  # 22:30 NZDT
+                    await asyncio.sleep(1.5)
+                    assert len(light_cmds()) == n and (await status())["light"]["reported"] == "unknown", light_cmds()
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await reported("off")
+                    clock("2026-11-05T20:05:00+00:00")  # 09:05 NZDT
+                    await asyncio.sleep(1)
+                    assert len(light_cmds()) == n and broker.light == "off", light_cmds()
+                    events.append({"contract":"after a paho reconnect of the same session the light reported on the "
+                                   "old connection is unknown: no lease on a stale OFF, no night OFF on a stale ON"})
+                    # A light already on by hand gets no lease and is not switched off later.
+                    broker.light = "on"
+                    broker.broadcast()
+                    await reported("on")
+                    kept = await call("light_inspection_lease", seconds=60, user_permission=True)
+                    assert kept["lease"] is None and kept["sent"] is False, kept
+                    clock("2026-11-05T20:30:00+00:00")
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected and broker.light == "on", light_cmds()
+                    # A lease granted just before quiet hours ends at their start; quiet hours win.
+                    broker.light = "off"
+                    broker.broadcast()
+                    clock("2026-11-05T08:59:00+00:00")  # 21:59 NZDT
+                    await reported("off")
+                    lease = await call("light_inspection_lease", seconds=900, user_permission=True)
+                    assert lease["seconds"] == 60 and lease["lease_until"].startswith("2026-11-05T22:00:00+13:00"), lease
+                    expected = expected + ["on"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "on", "lease ON")
+                    clock("2026-11-05T09:00:30+00:00")
+                    expected = expected + ["off"]
+                    await eventually(lambda: light_cmds() == expected and broker.light == "off", "lease outlived night")
+                    await lease_closed()
+                    events.append({"contract":"inspection lease returns the light off at its deadline, after a "
+                                   "failed client or a restart; manual ON kept; quiet hours win", "sent":6})
+                    # Disabled: quiet hours no longer act.
+                    st = await call("set_night_light_policy", enabled=False, user_permission=True)
+                    assert st["policy"]["enabled"] is False and st["policy"]["timezone"] == "Pacific/Auckland", st
+                    broker.light = "on"
+                    broker.broadcast()
+                    await asyncio.sleep(1)
+                    assert light_cmds() == expected and broker.light == "on", light_cmds()
+                    assert (await status())["lease"] is None
+                    pacing["done"] = True
+                    await pacer
+                    (tmp/"clock").unlink()
+                    events.append({"contract":"disabled quiet hours send nothing", "sent":0})
                     # Public workflows use the actual parser and FTPS client, with a real
                     # archive downloaded over TLS. No tool/library method is replaced.
                     ftps.reset = False
@@ -817,25 +1182,6 @@ async def campaign(seed, cycles):
                                           user_permission=True, **args)
                     def runs():
                         return sorted(p.name for p in store.iterdir() if p.is_dir()) if store.is_dir() else []
-                    async def replace_server(old, server_env):
-                        old.kill(); old.wait(timeout=5)
-                        for _ in range(100):
-                            if not broker.peers:
-                                break
-                            await asyncio.sleep(.02)
-                        assert not broker.peers, "dead server still owns MQTT socket"
-                        new = subprocess.Popen([sys.executable, str(ROOT/"harness/fixture_server.py")],
-                                               env=server_env, cwd=ROOT, stdout=log, stderr=log)
-                        for _ in range(100):
-                            assert new.poll() is None, "replacement fixture died"
-                            try:
-                                probe = socket.create_connection(("127.0.0.1", port), .1)
-                                probe.close(); break
-                            except OSError:
-                                await asyncio.sleep(.1)
-                        await until_live()
-                        assert broker.maximum == 1, broker.maximum
-                        return new
                     # A connected printer reports on its own; the many write calls below must not land in
                     # the stale window between this fixture's on-request reports.
                     reporting = asyncio.Event()

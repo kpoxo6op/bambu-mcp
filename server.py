@@ -198,6 +198,11 @@ def _startup() -> None:
         from auth import get_configured_printer_names
 
         printer_names = get_configured_printer_names()
+        # Quiet hours and inspection leases for the chamber light (night_light.py). Started even
+        # with no printer configured, so a printer added later is covered; opt-in per printer.
+        import night_light
+        night_light.controller.start(session_manager)
+        session_manager.register_update_callback(night_light.controller.wake)
         if not printer_names:
             log.info("No printers configured. Use add_printer(..., user_permission=True) to add one.")
             return
@@ -255,6 +260,11 @@ def _shutdown() -> None:
     # api_server runs autonomously in a non-daemon thread — do not stop it here.
     # It keeps the process alive after the MCP stdio transport exits, and is
     # terminated only when the process is explicitly killed.
+    try:
+        import night_light
+        night_light.controller.stop()
+    except Exception as exc:
+        log.warning(f"night_light shutdown error: {exc}")
     try:
         from camera import job_monitor
         job_monitor.stop_all()
