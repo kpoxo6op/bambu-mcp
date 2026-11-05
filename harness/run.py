@@ -127,7 +127,8 @@ def main():
     seeds = list(dict.fromkeys(corpus+[seed+i for i in range(args.rounds)]))
     jobs = [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
     for i, cmd in enumerate(jobs):
-        result = run_child(cmd, args.python, run/f"{i:02}.log", max(120, args.cycles*15))
+        # A campaign takes ~110 s at 8 cycles (2026-11-05, quiet-hours scenario added to ~94 s).
+        result = run_child(cmd, args.python, run/f"{i:02}.log", max(180, args.cycles*20))
         report["results"].append(result)
         print(json.dumps(result), flush=True)
         (run/"report.json").write_text(json.dumps(report, indent=2))

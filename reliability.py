@@ -159,6 +159,16 @@ def _external_free_bytes(status: dict) -> int | None:
     return None
 
 
+def _chamber_light_mode(status: dict) -> str | None:
+    """The chamber_light node's mode in a lights_report (first node if none is named so), or None."""
+    nodes = status.get("lights_report")
+    if not isinstance(nodes, list):
+        return None
+    nodes = [n for n in nodes if isinstance(n, dict) and isinstance(n.get("mode"), str)]
+    named = [n for n in nodes if n.get("node") == "chamber_light"]
+    return (named or nodes or [{}])[0].get("mode")
+
+
 def _in_mqtt_callback() -> bool:
     return bool(getattr(_tls, "in_message", False))
 
@@ -354,6 +364,9 @@ class ReliablePrinter(BambuPrinter):
         # as reported on this connection; never carried across a reconnect (the card may change).
         self._rel_sd: tuple[int, str, float] | None = None
         self._rel_ext_free: int | None = None
+        # Chamber light mode and monotonic time of the last lights_report on this connection. None
+        # until one arrives: bpm's light_state reads False before any report, which is not "off".
+        self._rel_light: tuple[str, float] | None = None
 
     def _rel_mark_incomplete(self, why: str) -> None:
         with self._rel_lock:
@@ -369,8 +382,10 @@ class ReliablePrinter(BambuPrinter):
             keys.add("bed")
         if "nozzle_temper" in status or "device" in status:
             keys.add("nozzle")
-        sd, free = _sd_card_state(status), _external_free_bytes(status)
+        sd, free, light = _sd_card_state(status), _external_free_bytes(status), _chamber_light_mode(status)
         with self._rel_lock:
+            if light is not None:
+                self._rel_light = (light, time.monotonic())
             if "nozzle_diameter" in status:
                 self._rel_nozzle = str(status["nozzle_diameter"])
             if sd is not None:
@@ -538,6 +553,11 @@ class ReliablePrinter(BambuPrinter):
         """Free bytes of external storage as the firmware reported them on this connection, or None."""
         with self._rel_lock:
             return self._rel_ext_free
+
+    def reported_light(self) -> tuple[str, float] | None:
+        """(mode, monotonic time) of the chamber light as last reported on this connection, or None."""
+        with self._rel_lock:
+            return self._rel_light
 
     def _rel_full_state_wait(self, now: float) -> float:
         """Seconds until another full-state request may be sent (caller holds _rel_lock)."""

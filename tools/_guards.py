@@ -61,7 +61,8 @@ import inspect
 # Tools that make the printer act or change (MQTT commands, SD-card writes). Refused while
 # telemetry is not live. Their own user_permission and active-print checks still run first.
 PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
-    "calibrate_ams_remaining", "clear_print_error", "create_folder", "delete_file", "load_filament",
+    "calibrate_ams_remaining", "clear_print_error", "create_folder", "delete_file", "light_inspection_lease",
+    "load_filament",
     "pause_print", "print_file", "refresh_nozzles", "register_sd_card", "rename_printer", "rename_sdcard_file",
     "resume_print", "select_extrusion_calibration", "send_ams_control_command", "send_gcode",
     "send_mqtt_command", "set_air_printing_detection", "set_ams_filament_setting",
@@ -77,7 +78,8 @@ PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
 # are how state recovers).
 NON_PRINTER_WRITE_TOOLS: frozenset[str] = frozenset({
     "add_printer", "disconnect_printer", "download_file", "force_state_refresh", "pause_mqtt_session",
-    "prepare_print_job", "remove_printer", "resume_mqtt_session", "set_user_pref", "start_printer",
+    "prepare_print_job", "remove_printer", "resume_mqtt_session", "set_night_light_policy", "set_user_pref",
+    "start_printer",
     "start_stream", "stop_stream", "trigger_printer_refresh", "truncate_log", "update_printer_credentials",
 })
 
