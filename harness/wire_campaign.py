@@ -824,6 +824,18 @@ async def campaign(seed, cycles):
                             await asyncio.sleep(.05)
                     async def status():
                         return await call("get_night_light_policy")
+                    async def reported(mode):
+                        for _ in range(60):
+                            if (await status())["light"]["reported"] == mode:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError(f"light not reported {mode}: {await status()}")
+                    async def lease_closed():  # closed once the server has seen the light reported off
+                        for _ in range(60):
+                            if (await status())["lease"] is None:
+                                return
+                            await asyncio.sleep(.05)
+                        raise AssertionError(f"lease still open: {await status()}")
                     pacing = {"on": True, "done": False}
                     async def pace():  # a connected printer keeps reporting, as above
                         while not pacing["done"]:
@@ -855,10 +867,7 @@ async def campaign(seed, cycles):
                     # A light switched on by hand in the evening stays on, in either season.
                     broker.light = "on"
                     clock("2026-11-05T08:59:50+00:00")  # 21:59:50 NZDT
-                    for _ in range(40):
-                        if (await status())["light"]["reported"] == "on":
-                            break
-                        await asyncio.sleep(.05)
+                    await reported("on")
                     await asyncio.sleep(1)
                     clock("2026-06-15T09:30:00+00:00")  # 21:30 NZST; 22:30 at a fixed +13
                     await asyncio.sleep(1)
@@ -945,11 +954,7 @@ async def campaign(seed, cycles):
                     clock("2026-11-05T20:00:31+00:00")
                     expected = expected + ["off"]
                     await eventually(lambda: light_cmds() == expected and broker.light == "off", "lease not ended")
-                    for _ in range(40):
-                        if (await status())["lease"] is None:
-                            break
-                        await asyncio.sleep(.05)
-                    assert (await status())["lease"] is None
+                    await lease_closed()
                     # Again, and the server is SIGKILLed during the lease; it restarts past the deadline.
                     lease = await call("light_inspection_lease", seconds=120, user_permission=True)
                     expected = expected + ["on"]
@@ -961,10 +966,11 @@ async def campaign(seed, cycles):
                     expected = expected + ["off"]
                     await eventually(lambda: light_cmds() == expected and broker.light == "off",
                                      "lease deadline not enforced after restart")
+                    await lease_closed()
                     # A light already on by hand gets no lease and is not switched off later.
                     broker.light = "on"
                     broker.broadcast()
-                    await asyncio.sleep(.5)
+                    await reported("on")
                     kept = await call("light_inspection_lease", seconds=60, user_permission=True)
                     assert kept["lease"] is None and kept["sent"] is False, kept
                     clock("2026-11-05T20:30:00+00:00")
@@ -974,7 +980,7 @@ async def campaign(seed, cycles):
                     broker.light = "off"
                     broker.broadcast()
                     clock("2026-11-05T08:59:00+00:00")  # 21:59 NZDT
-                    await asyncio.sleep(.5)
+                    await reported("off")
                     lease = await call("light_inspection_lease", seconds=900, user_permission=True)
                     assert lease["seconds"] == 60 and lease["lease_until"].startswith("2026-11-05T22:00:00+13:00"), lease
                     expected = expected + ["on"]
@@ -982,6 +988,7 @@ async def campaign(seed, cycles):
                     clock("2026-11-05T09:00:30+00:00")
                     expected = expected + ["off"]
                     await eventually(lambda: light_cmds() == expected and broker.light == "off", "lease outlived night")
+                    await lease_closed()
                     events.append({"contract":"inspection lease returns the light off at its deadline, after a "
                                    "failed client or a restart; manual ON kept; quiet hours win", "sent":6})
                     # Disabled: quiet hours no longer act.
