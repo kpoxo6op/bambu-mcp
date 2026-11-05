@@ -115,12 +115,15 @@ current connection. ``error`` is present when the stored policy file is unreadab
 
 Switch the chamber light on for a bounded inspection; the server switches it off after.
 
-**WHEN to use:** light the chamber briefly for a camera capture or a look, with the OFF
-guaranteed even if the capture or the caller fails. Call with ``seconds`` 0 when done.
+**WHEN to use:** light the chamber briefly for a camera capture or a look; the server sends
+the OFF even if the capture or the caller fails. Call with ``seconds`` 0 when done.
 
 **WRITE GUARD:** when the printer reports the light off, persists the deadline and then
 sends the same ON command as ``set_chamber_light``. At the deadline, also after a server
-restart, the server sends OFF once the printer reports the light on. A light already on
+restart, the server sends OFF whether or not the ON was reported, but only while telemetry
+is writable (a printer offline then gets it when it is back). The lease ends only when a
+report newer than that OFF says off; until then the OFF repeats on a doubling back-off,
+and an unproven lease is dropped 6 h after its deadline. A light already on
 is left alone with no lease, so a manual ON is never switched off. Quiet hours take
 precedence: a lease is refused inside them and ends at the next quiet-hours start. With
 ``user_permission`` False nothing is stored or sent.
@@ -139,8 +142,8 @@ OFF; ``set_night_light_policy`` keeps it off at night.
 ``{lease_until, seconds, restore, sent}``: ``sent`` True when an ON was sent.
 ``{lease: None, sent: False, light: "on", detail}`` when the light was already on.
 ``{ended, detail}`` for ``seconds`` 0. ``{error, sent: False, detail}`` with error
-``quiet_hours``, ``not_connected`` or ``light_unknown`` (not reported on this
-connection); ``{"error": str}`` for a refused permission or invalid ``seconds``.
+``quiet_hours``, ``not_connected`` or ``light_unknown`` (not reported as on or off on
+this connection); ``{"error": str}`` for a refused permission or invalid ``seconds``.
 
 ## set_bed_temp
 
@@ -317,7 +320,7 @@ newer report still says on, with a doubling back-off. With ``user_permission`` F
 nothing is stored.
 
 **Sibling disambiguation:** ``get_night_light_policy`` reads the policy and what it last
-did; ``light_inspection_lease`` switches the light on briefly with a guaranteed OFF;
+did; ``light_inspection_lease`` switches the light on briefly with an automatic OFF;
 ``set_chamber_light`` switches the light once.
 
 **Parameters**

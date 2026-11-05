@@ -1,7 +1,7 @@
 # Chamber light quiet hours and inspection leases
 
 The server keeps a printer's chamber light off during configured quiet hours, and can light the
-chamber briefly for an inspection with the OFF guaranteed. Source: `night_light.py`; tools
+chamber briefly for an inspection with the server sending the OFF. Source: `night_light.py`; tools
 `set_night_light_policy`, `get_night_light_policy`, `light_inspection_lease` (`tools/climate.py`).
 
 ## Why
@@ -31,12 +31,22 @@ session's update notifications, no agent, no extra connection, no camera or job 
 ### Inspection lease
 
 `light_inspection_lease(name, seconds, user_permission=True)` (1-900 s) switches a light reported
-OFF to ON after persisting the deadline. At the deadline the server switches it OFF once it is
-reported ON, also if the caller crashed or the server restarted in between. `seconds=0` ends a
+OFF to ON after persisting the deadline. At the deadline the server sends the lease's own OFF,
+also if the caller crashed or the server restarted in between, and whether or not the printer
+reported the ON: QoS 0 feedback can be lost and status deltas may omit `lights_report`, so the
+server may still hold the OFF reported before the ON. That earlier OFF never ends the lease.
+The lease ends only when a report newer than its OFF says `off`; until then the OFF repeats on
+the same back-off (60 s doubling to 30 min). `seconds=0` ends a
 lease early (the OFF follows from the server). A repeat while a lease runs extends it. A light
 that is already ON gets no lease and is never switched off by this mechanism, so an ordinary
-manual ON during the day is left alone. A lease still unresolved 6 h after its deadline (printer
-unreachable) is dropped.
+manual ON during the day is left alone. A lease still unresolved 6 h after its deadline is
+dropped.
+
+The OFF goes through the same guard as every write: nothing is sent while telemetry is not
+writable. A printer or link down at the deadline therefore gets the OFF only when telemetry is
+writable again (after a reconnect or server restart, the persisted deadline is caught up at
+once), and not at all if that takes more than 6 h. A light mode other than `on`/`off` in a
+report is `unknown`: no lease is granted on it and it does not end one.
 
 ### Precedence
 
@@ -72,7 +82,8 @@ is harmless, and they take effect again on a release that has this feature.
   `docs/captures/` does; bpm parses it for every model). Until it arrives on a connection the
   status says `unknown` and nothing is sent: after deployment, confirm `light.reported` is
   `on` or `off` for each enabled printer.
-* OFF commands are QoS 0 like every command; the effect is confirmed only by the next report.
+* OFF commands are QoS 0 like every command; the effect is confirmed only by a later report
+  that carries `lights_report`. Neither the E2E gate nor the server verifies the physical lamp.
 * A light switched on inside quiet hours goes off again: to light the chamber at night, disable
   the policy first.
 * The E2E gate (`harness/README.md`) exercises these rules against the simulated printer with a

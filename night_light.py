@@ -25,10 +25,13 @@ Rules, evaluated every TICK_S and when the printer reports:
   is ever changed. A running print is not touched.
 
 Inspection lease (``grant_lease``): switches a light reported OFF to ON for at most
-LEASE_MAX_S and persists the deadline first, so the light goes OFF again at the deadline even
-if the caller fails, disconnects or the daemon restarts (catch-up after reconnect). A light
-already ON is left alone and gets no lease, so an ordinary manual ON is never switched off.
-An expired lease still waiting for a report is dropped after LEASE_GRACE_S.
+LEASE_MAX_S and persists the deadline first. At the deadline the lease sends its own OFF
+whether or not the printer has reported the ON (it need not: QoS 0, and status deltas may omit
+lights_report), through the same guard, so only while telemetry is writable; a printer offline
+at the deadline gets it once it is writable again, also after a daemon restart. The lease
+closes only on an OFF report newer than that OFF; until then the OFF repeats on the back-off.
+A light already ON is left alone and gets no lease, so an ordinary manual ON is never switched
+off. An expired lease never proven off is dropped LEASE_GRACE_S after its deadline.
 
 Precedence: quiet hours win. A lease is refused inside quiet hours and is cut short at the next
 quiet-hours start; inside quiet hours the light goes OFF whatever any lease says.
@@ -239,25 +242,31 @@ class _Controller:
             reported = getattr(printer, "reported_light", None)
             if printer is None or not callable(reported) or not reliability.health(name).get("writable"):
                 return  # stale, disconnected or starting: nothing is sent
-            obs = reported()
-            if obs is None:
-                return  # not reported on this connection: unknown, not off
-            mode, seen = obs
+            # None: not reported on this connection; "unknown": unrecognised mode. Neither is off.
+            mode, seen = reported() or ("unknown", None)
             rt = self._rt(name)
-            if mode != "on":
+            # A lease closes only on an OFF report newer than its own OFF: the OFF cached from before
+            # its ON (the printer need not report the ON) proves nothing.
+            off_proof = rt["last_off"] is not None and seen is not None and seen > rt["last_off"]
+            if mode == "off" and (off_proof or not lease_due):
                 rt["off_sends"] = 0
                 if lease_due:
                     self._save(name, policy, None)
-                    log.info("night_light: %s light reported %s after the lease; lease closed", name, mode)
+                    log.info("night_light: %s light reported off after the lease's OFF; lease closed", name)
                 return
-            if rt["last_off"] is not None:
-                if seen <= rt["last_off"]:
+            if lease_due and rt["last_off"] is None:
+                pass  # the lease's own OFF, whatever the (possibly lagging) report says
+            elif mode != "on" and not lease_due:
+                return  # quiet hours act only on a light reported on
+            elif rt["last_off"] is not None:
+                if not lease_due and seen <= rt["last_off"]:
                     return  # no report since our last OFF; wait for one
+                # Repeats: a newer ON report, or a lease with no OFF report since its OFF.
                 wait = reliability._bounded_backoff(OFF_BACKOFF_MIN_S, OFF_BACKOFF_MAX_S,
                                                     max(0, rt["off_sends"] - 1))
                 if rt["off_sends"] and time.monotonic() - rt["last_off"] < wait:
                     return
-            reason = "quiet hours" if night else "inspection lease ended"
+            reason = "quiet hours" if night and mode == "on" else "inspection lease ended"
             rt["last_off"] = time.monotonic()
             rt["off_sends"] += 1
             try:
@@ -315,9 +324,10 @@ class _Controller:
             if printer is None:
                 return {"error": "not_connected", "sent": False, "detail": f"Printer '{name}' not connected"}
             obs = printer.reported_light()
-            if obs is None:
+            if obs is None or obs[0] not in ("on", "off"):
                 return {"error": "light_unknown", "sent": False,
-                        "detail": "the printer has not reported its light on this connection; nothing sent"}
+                        "detail": "the printer has not reported its light as on or off on this "
+                                  "connection; nothing sent"}
             until = now + seconds
             if policy and policy["enabled"]:
                 until = min(until, _next_local(policy, policy["start"], now))
@@ -331,13 +341,14 @@ class _Controller:
             result = {"lease_until": _iso(new["until"], policy), "seconds": round(new["until"] - now),
                       "restore": "off at the deadline, also after a restart or failed capture",
                       "sent": False}
+            # Earlier OFFs are not this lease's: its deadline sends its own and waits for a newer report.
+            self._rt(name).update(off_sends=0, last_off=None)
             if obs[0] != "on":
                 # A failure propagates to the tool guard, which reports what was sent. The lease
-                # stays either way: it only ever switches off a light reported on, and closes
-                # once the light is reported off after the deadline.
+                # stays either way: its OFF is idempotent, and it closes only once the light is
+                # reported off after that OFF.
                 printer.light_state = True
                 result["sent"] = True
-            self._rt(name)["off_sends"] = 0
             return result
 
     def status(self, name: str) -> dict:

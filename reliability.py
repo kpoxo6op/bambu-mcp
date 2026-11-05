@@ -160,13 +160,19 @@ def _external_free_bytes(status: dict) -> int | None:
 
 
 def _chamber_light_mode(status: dict) -> str | None:
-    """The chamber_light node's mode in a lights_report (first node if none is named so), or None."""
+    """The chamber_light node's mode in a lights_report (first node if none is named so), or None.
+
+    Only "on" and "off" are taken as such; any other mode is "unknown", never a stand-in for off.
+    """
     nodes = status.get("lights_report")
     if not isinstance(nodes, list):
         return None
-    nodes = [n for n in nodes if isinstance(n, dict) and isinstance(n.get("mode"), str)]
+    nodes = [n for n in nodes if isinstance(n, dict) and "mode" in n]
     named = [n for n in nodes if n.get("node") == "chamber_light"]
-    return (named or nodes or [{}])[0].get("mode")
+    if not (named or nodes):
+        return None
+    mode = (named or nodes)[0]["mode"]
+    return mode if mode in ("on", "off") else "unknown"
 
 
 def _in_mqtt_callback() -> bool:
