@@ -372,6 +372,7 @@ class ReliablePrinter(BambuPrinter):
         self._rel_ext_free: int | None = None
         # Chamber light mode and monotonic time of the last lights_report on this connection. None
         # until one arrives: bpm's light_state reads False before any report, which is not "off".
+        # Never carried across a reconnect (the light may change while the link is down).
         self._rel_light: tuple[str, float] | None = None
 
     def _rel_mark_incomplete(self, why: str) -> None:
@@ -503,6 +504,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
                 self._rel_sd = self._rel_ext_free = None
+                self._rel_light = None
                 # A new connection may be answered where the last one was not.
                 self._rel_full_unanswered = 0
                 self._rel_last_pushall_req = 0.0
@@ -523,6 +525,7 @@ class ReliablePrinter(BambuPrinter):
                 self._rel_baseline_at = None
                 self._rel_nozzle = None
                 self._rel_sd = self._rel_ext_free = None
+                self._rel_light = None
                 self._rel_last_error = f"mqtt disconnected: {reason_code}"
             if was_connected:  # once per lost connection, not per failed retry
                 log.warning("ReliablePrinter: MQTT disconnected (%s); telemetry not live until it reconnects",

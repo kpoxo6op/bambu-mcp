@@ -1063,6 +1063,43 @@ async def campaign(seed, cycles):
                     events.append({"contract":"lease OFF at the deadline without an ON report; closed only by a "
                                    "newer OFF report, not the cached one or a malformed mode; stale sends "
                                    "nothing; persisted across SIGKILL; late ON switched off"})
+                    # paho reconnects the same session (no restart, no new manager) after a link drop, and
+                    # the light changes while the link is down. The new connection's reports keep telemetry
+                    # live but carry no lights_report: the light reported on the old connection is unknown
+                    # on the new one, whether it was off (no lease on it) or on (no night OFF on it).
+                    async def reconnect_unreported(light):
+                        before = (await call("get_printer_connection_status"))["telemetry"]
+                        connections = broker.connections
+                        broker.withhold_light = True
+                        broker.drop()
+                        broker.light = light
+                        await eventually(lambda: broker.connections > connections, "paho never reconnected")
+                        await until_live()
+                        after = (await call("get_printer_connection_status"))["telemetry"]
+                        assert (after["live"] and after["restarts"] == before["restarts"]
+                                and after["session_generation"] == before["session_generation"]
+                                and proc.poll() is None), (before, after)
+                        st = await status()
+                        assert st["light"]["reported"] == "unknown" and st["telemetry"]["writable"], st
+                    n = len(light_cmds())
+                    await reconnect_unreported("on")
+                    refused = await call("light_inspection_lease", seconds=30, user_permission=True)
+                    assert refused.get("error") == "light_unknown" and refused["sent"] is False, refused
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await reported("on")
+                    await reconnect_unreported("off")
+                    clock("2026-11-05T09:30:00+00:00")  # 22:30 NZDT
+                    await asyncio.sleep(1.5)
+                    assert len(light_cmds()) == n and (await status())["light"]["reported"] == "unknown", light_cmds()
+                    broker.withhold_light = False
+                    broker.broadcast()
+                    await reported("off")
+                    clock("2026-11-05T20:05:00+00:00")  # 09:05 NZDT
+                    await asyncio.sleep(1)
+                    assert len(light_cmds()) == n and broker.light == "off", light_cmds()
+                    events.append({"contract":"after a paho reconnect of the same session the light reported on the "
+                                   "old connection is unknown: no lease on a stale OFF, no night OFF on a stale ON"})
                     # A light already on by hand gets no lease and is not switched off later.
                     broker.light = "on"
                     broker.broadcast()
