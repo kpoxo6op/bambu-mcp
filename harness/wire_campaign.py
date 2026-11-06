@@ -431,7 +431,8 @@ async def campaign(seed, cycles):
                    # The server runs this fixed process as its preparer, as it runs the real
                    # Soyrack preflight in production; see fixture_preparer.py for what it is not.
                    BAMBU_PREFLIGHT_COMMAND_JSON=json.dumps([sys.executable, str(ROOT/"harness/fixture_preparer.py")]),
-                   BAMBU_PREFLIGHT_TIMEOUT_S="3", BAMBU_HARNESS_CLOCK_FILE=str(tmp/"clock"))
+                   BAMBU_PREFLIGHT_TIMEOUT_S="3", BAMBU_HARNESS_CLOCK_FILE=str(tmp/"clock"),
+                   BAMBU_HARNESS_PREPARER_SCENARIO=str(tmp/"preparer-scenario"))
         store = tmp/"home"/".bambu-mcp"/"preflight"
         Path(env["HOME"]).mkdir()
         log = (tmp/"server.log").open("w+")
@@ -1572,6 +1573,195 @@ async def campaign(seed, cycles):
                     events.append({"contract":"prepared job: wrong plate, bed type, nozzle, unreported nozzle or SD "
                                    "state and remote tamper refused; verified start names the prepared plate and MD5, "
                                    "reaches the wire once; repeat refused", "sent":1})
+                    # Geometry policy 2 is admitted per part: exactly mid_deck_flat and mid_deck_pocket_coupon,
+                    # with their release interface, for a P1S with a 0.4 nozzle. harness/fixtures holds reports
+                    # the real preparer wrote at bf7b6b68; each case below edits one of them, and its refusal
+                    # text proves the rule that refused it. Fixture jobs prove admission, not manufacturing.
+                    POLICY2_PARTS = ("mid_deck_flat", "mid_deck_pocket_coupon")
+                    async def prepare_as(part, **scenario):
+                        (tmp/"preparer-scenario").write_text(json.dumps(scenario))
+                        try:
+                            return await prepare(part)
+                        finally:
+                            (tmp/"preparer-scenario").unlink()
+                    async def one_start(part, prepared, remote):
+                        """Upload, read back and start a receipt; exactly one start reaches the printer."""
+                        sent, name = len(broker.mutations()), remote.lstrip("/")
+                        job_bytes = Path(prepared["job_path"]).read_bytes()
+                        up = await upload(prepared["job_path"], remote)
+                        assert up.get("admission", {}).get("sha256") == prepared["sha256"] and up["storage"], up
+                        assert ftps.files[name] == job_bytes, "card bytes differ from the job"
+                        downloads = len(ftps.downloads)
+                        printed = await start(remote)
+                        assert "error" not in printed and printed["admission"]["consumed"] is True, printed
+                        assert name in ftps.downloads[downloads:], "card not re-read before the start"
+                        await asyncio.sleep(.1)
+                        commands = broker.mutations()[sent:]
+                        assert len(commands) == 1, commands
+                        command = commands[0]["print"]
+                        assert (command["command"], command["file"], command["bed_type"], command["md5"]) == (
+                            "project_file", remote, "textured_plate",
+                            hashlib.md5(job_bytes).hexdigest().upper()), command
+                        assert (await start(remote)).get("error") == "print_not_admitted"
+                        assert len(broker.mutations()) == sent + 1, broker.mutations()[sent:]
+                    card_available(200)
+                    policy2_jobs = {}
+                    for part in POLICY2_PARTS:
+                        admitted = await prepare_as(part)
+                        assert admitted.get("success") and admitted["part"] == part, admitted
+                        assert admitted["target"]["printer_model"] == "Bambu Lab P1S"
+                        assert admitted["target"]["nozzle_diameter"] == ["0.4"], admitted
+                        summary = admitted["report"]
+                        interface = summary["part"]["geometry"]["release_interface"]
+                        assert summary["geometry_policy_version"] == 2 and summary["part"]["name"] == part, summary
+                        assert summary["part"]["geometry"]["policy_version"] == 2, summary
+                        assert (interface["extension"], interface["pass"], interface["failures"]) == (
+                            "plug_release_gap", True, []), interface
+                        assert interface["air_layers"] == 2 and interface["air_mm"] == .4, interface
+                        await one_start(part, admitted, f"/{part}.gcode.3mf")
+                        policy2_jobs[part] = admitted
+                    # Policy 1 is unchanged for every other part, including a nozzle policy 2 does not accept.
+                    top_cap = await prepare_as("top_cap")
+                    assert top_cap.get("success") and top_cap["report"]["geometry_policy_version"] == 1, top_cap
+                    assert "release_interface" not in top_cap["report"]["part"]["geometry"], top_cap
+                    await one_start("top_cap", top_cap, "/top_cap.gcode.3mf")
+                    other_nozzle = await prepare_as("top_cap", set=[["target", "nozzle_diameter", ["0.6"]]],
+                                                    job={"nozzle":"0.6"})
+                    assert other_nozzle.get("success"), other_nozzle
+                    events.append({"contract":"policy 2 for its two named parts and policy 1 top_cap each prepare, "
+                                   "upload, read back and start once; the receipt reports policy, part and release "
+                                   "interface", "sent":3})
+                    before, stores, downloads = len(broker.mutations()), len(ftps.stores), len(ftps.downloads)
+                    choice = random.Random(seed ^ 0x9012)
+                    FAILURE = [{"z":3, "feature":"release interface", "why":"solid in the air gap"}]
+                    NAMED_CASES = {
+                        "report policy 1": ({"set":[["report", "geometry_policy_version", 1]]}, "geometry_policy_version is 1, not 2"),
+                        "report policy 3": ({"set":[["report", "geometry_policy_version", 3]]}, "geometry_policy_version is 3, not 2"),
+                        "report policy text": ({"set":[["report", "geometry_policy_version", "2"]]}, "geometry_policy_version is '2', not 2"),
+                        "report policy float": ({"set":[["report", "geometry_policy_version", 2.0]]}, "geometry_policy_version is 2.0, not 2"),
+                        "report policy missing": ({"delete":[["report", "geometry_policy_version"]]}, "geometry_policy_version is None, not 2"),
+                        "entry policy 1": ({"set":[["geometry", "policy_version", 1]]}, "ran policy 1, not 2"),
+                        "entry policy 3": ({"set":[["geometry", "policy_version", 3]]}, "ran policy 3, not 2"),
+                        "entry policy text": ({"set":[["geometry", "policy_version", "2"]]}, "ran policy '2', not 2"),
+                        "entry policy float": ({"set":[["geometry", "policy_version", 2.0]]}, "ran policy 2.0, not 2"),
+                        "entry policy missing": ({"delete":[["geometry", "policy_version"]]}, "ran policy None, not 2"),
+                        "both policy 1, no interface": ({"set":[["report", "geometry_policy_version", 1], ["geometry", "policy_version", 1]],
+                                                         "delete":[["geometry", "release_interface"]]}, "geometry_policy_version is 1, not 2"),
+                        "both policy 3": ({"set":[["report", "geometry_policy_version", 3], ["geometry", "policy_version", 3]]}, "geometry_policy_version is 3, not 2"),
+                        "no interface": ({"delete":[["geometry", "release_interface"]]}, "release_interface is not an object"),
+                        "interface null": ({"set":[["geometry", "release_interface", None]]}, "release_interface is not an object"),
+                        "interface list": ({"set":[["geometry", "release_interface", ["plug_release_gap"]]]}, "release_interface is not an object"),
+                        "interface false": ({"set":[["interface", "pass", False]]}, "release_interface.pass is not true"),
+                        "interface pass 1": ({"set":[["interface", "pass", 1]]}, "release_interface.pass is not true"),
+                        "interface pass missing": ({"delete":[["interface", "pass"]]}, "release_interface.pass is not true"),
+                        "no extension": ({"delete":[["interface", "extension"]]}, "extension is None"),
+                        "unknown extension": ({"set":[["interface", "extension", "welded_fins"]]}, "extension is 'welded_fins'"),
+                        "extension type": ({"set":[["interface", "extension", ["plug_release_gap"]]]}, "extension is ['plug_release_gap']"),
+                        "interface failures": ({"set":[["interface", "failures", FAILURE]]}, "release_interface reports failures"),
+                        "interface failures missing": ({"delete":[["interface", "failures"]]}, "release_interface reports failures: None"),
+                        "interface failures type": ({"set":[["interface", "failures", "none"]]}, "release_interface reports failures: 'none'"),
+                        "geometry failures": ({"set":[["geometry", "failures", FAILURE]]}, "the geometry check reports failures"),
+                        "geometry failures count": ({"set":[["geometry", "failures_count", 3]]}, "count 3"),
+                        "geometry failed": ({"set":[["geometry", "pass", False]]}, "geometry.pass is not true"),
+                        "report failed": ({"set":[["report", "pass", False]]}, "does not say pass: true"),
+                        "part problems": ({"set":[["entry", "problems", ["the slicer generated support"]]]}, "the part has problems"),
+                        "forged hash": ({"set":[["entry", "job", "f"*64]]}, "SHA-256 does not match"),
+                        "target X1 Carbon": ({"set":[["target", "printer_model", "Bambu Lab X1 Carbon"]]}, "not qualified for geometry policy 2"),
+                        "target and job 0.6": ({"set":[["target", "nozzle_diameter", ["0.6"]]], "job":{"nozzle":"0.6"}}, "'0.6' is not qualified for geometry policy 2"),
+                        "target 0.40": ({"set":[["target", "nozzle_diameter", ["0.40"]]]}, "'0.40' is not qualified for geometry policy 2"),
+                        "two nozzles": ({"set":[["target", "nozzle_diameter", ["0.4", "0.4"]]]}, "not exactly one nozzle"),
+                        "numeric nozzle": ({"set":[["target", "nozzle_diameter", [0.4]]]}, "not exactly one nozzle"),
+                        "job sliced for 0.6": ({"job":{"nozzle":"0.6"}}, "G-code declares nozzle_diameter"),
+                        "job sliced for X1 Carbon": ({"job":{"printer_model":"Bambu Lab X1 Carbon"}}, "G-code declares printer_model"),
+                    }
+                    async def refused_run(part, scenario):
+                        """The preparer ran and wrote a job; it is refused and that job cannot be uploaded."""
+                        seen = set(runs())
+                        refused = await prepare_as(part, **scenario)
+                        assert refused.get("error") == "preflight_rejected" and "receipt_id" not in refused, refused
+                        (run,) = set(runs()) - seen
+                        rejected = await upload(store/run/part/f"{part}.gcode.3mf", f"/{part}.gcode.3mf")
+                        assert rejected.get("error") == "job_not_prepared", rejected
+                        return refused["detail"]
+                    for case, (scenario, why) in NAMED_CASES.items():
+                        detail = await refused_run(choice.choice(POLICY2_PARTS), scenario)
+                        assert why in detail, (case, detail)
+                    # Policy 2 (and the relabel of its evidence as policy 1) for any other part name.
+                    for part, scenario, why in (
+                            ("mid_deck", {"anchor":"mid_deck_flat"}, "geometry_policy_version is 2, not 1"),
+                            ("top_cap", {"anchor":"mid_deck_flat"}, "geometry_policy_version is 2, not 1"),
+                            ("mid_deck_flat2", {"anchor":"mid_deck_flat"}, "geometry_policy_version is 2, not 1"),
+                            ("mid-deck-flat", {"anchor":"mid_deck_flat"}, "geometry_policy_version is 2, not 1"),
+                            ("mid_deck", {"anchor":"mid_deck_flat", "set":[["report", "geometry_policy_version", 1]]},
+                             "the geometry check ran policy 2, not 1"),
+                            ("mid_deck", {"anchor":"mid_deck_flat", "set":[["report", "geometry_policy_version", 1],
+                                                                          ["geometry", "policy_version", 1]]},
+                             "may not report a release interface"),
+                            ("top_cap", {"set":[["report", "geometry_policy_version", 3], ["geometry", "policy_version", 3]]},
+                             "geometry_policy_version is 3, not 1")):
+                        detail = await refused_run(part, scenario)
+                        assert why in detail, (part, scenario, detail)
+                    assert len(ftps.stores) == stores and len(ftps.downloads) == downloads, ftps.stores[stores:]
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"policy 2 with a bad version, type, extension, interface, target or job, policy 1 "
+                                   "of its parts, and policy 2 of any other part admit nothing", "cases":len(NAMED_CASES)+7,
+                                   "stored":0, "sent":0})
+                    # Every guard after preparation holds for a policy 2 receipt.
+                    flat = policy2_jobs["mid_deck_flat"]
+                    card_available(10)
+                    refused = await upload(flat["job_path"], "/p2.gcode.3mf")
+                    assert refused.get("error") == "storage_insufficient" and len(ftps.stores) == stores, refused
+                    card_available(200)
+                    assert (await upload(flat["job_path"], "/p2.gcode.3mf")).get("admission")
+                    refused = await start("/p2.gcode.3mf", bed_type="cool_plate")
+                    assert refused.get("error") == "bed_type_mismatch", refused
+                    broker.nozzle = "0.6"
+                    await nozzle_reported("0.6")
+                    refused = await start("/p2.gcode.3mf")
+                    assert refused.get("error") == "nozzle_mismatch", refused
+                    broker.nozzle = "0.4"
+                    await nozzle_reported("0.4")
+                    card_job = ftps.files["p2.gcode.3mf"]
+                    ftps.files["p2.gcode.3mf"] = card_job[:-1] + bytes([card_job[-1] ^ 1])
+                    refused = await start("/p2.gcode.3mf")
+                    assert refused.get("error") == "remote_file_mismatch", refused
+                    ftps.files["p2.gcode.3mf"] = card_job
+                    assert (await start("/p2.gcode.3mf")).get("error") == "print_not_admitted"
+                    edited = await prepare_as("mid_deck_pocket_coupon")
+                    Path(edited["job_path"]).write_bytes(Path(edited["job_path"]).read_bytes() + b"\0")
+                    refused = await upload(edited["job_path"], "/p2-edited.gcode.3mf")
+                    assert refused.get("error") == "job_modified", refused
+                    assert len(broker.mutations()) == before, broker.mutations()[before:]
+                    events.append({"contract":"a policy 2 receipt keeps the storage, plate, nozzle, card read-back, "
+                                   "edited-job and one-start guards", "sent":0})
+                    # With --preparer-artifacts: the primary preparer's actual reports and jobs through the same
+                    # boundary, and the actual fused policy 1 candidate refused with its valid hash and target.
+                    artifacts = os.environ.get("BAMBU_HARNESS_PREPARER_ARTIFACTS")
+                    if artifacts:
+                        for part, name, policy in (("mid_deck_flat", "mid_deck_flat-bf7b6b68", 2),
+                                                   ("mid_deck_pocket_coupon", "mid_deck_pocket_coupon-bf7b6b68", 2),
+                                                   ("top_cap", "top_cap-bf7b6b68", 1)):
+                            real = await prepare_as(part, real=name)
+                            assert real.get("success"), real
+                            source = json.loads((Path(artifacts)/name/"preflight.json").read_text())
+                            assert real["sha256"] == source["parts"][part]["job"], real
+                            assert real["report"]["commit"] == "bf7b6b68a8b20aaf659b10a3547a8be7e6923d9a", real
+                            assert real["report"]["geometry_policy_version"] == policy, real
+                            if policy == 2:
+                                assert real["report"]["part"]["geometry"]["release_interface"] == \
+                                    source["parts"][part]["geometry"]["release_interface"], real
+                            await one_start(part, real, f"/real-{part}.gcode.3mf")
+                        before, stores = len(broker.mutations()), len(ftps.stores)
+                        for name, why in (("fused-b843191d", "geometry_policy_version is 1, not 2"),
+                                          ("fused-1ed5c1a3", "geometry_policy_version is 1, not 2"),
+                                          ("gap-shared-profile", "geometry_policy_version is 1, not 2"),
+                                          ("welded-fins", "does not say pass: true"),
+                                          ("flat-without-plugs", "does not say pass: true")):
+                            refused = await prepare_as("mid_deck_flat", real=name)
+                            assert refused.get("error") == "preflight_rejected" and why in refused["detail"], (name, refused)
+                        assert len(ftps.stores) == stores and len(broker.mutations()) == before
+                        events.append({"contract":"actual preparer outputs: policy 2 parts and top_cap admitted and started "
+                                       "once; fused policy 1 candidates and failed runs refused", "sent":3})
                     # Upload, rename and delete drop the admissions they could invalidate, first. The card
                     # is case-insensitive, so a rename onto another spelling of the path counts.
                     before = len(broker.mutations())
@@ -1637,6 +1827,7 @@ async def campaign(seed, cycles):
                     # itself. The replacement serves an A1 (serial 039...): a P1S job prepared and uploaded
                     # there is refused as the wrong model before any card read or command.
                     assert (await upload(prep["job_path"], "/restart.gcode.3mf")).get("admission")
+                    assert (await upload(flat["job_path"], "/p2-restart.gcode.3mf")).get("admission")
                     before, downloads = len(broker.mutations()), len(ftps.downloads)
                     broker.serial = "03900TESTONLY"
                     proc = await replace_server(proc, {**env, "BAMBU_PRINTER_SERIAL":"03900TESTONLY"})
@@ -1644,6 +1835,13 @@ async def campaign(seed, cycles):
                     assert refused.get("error") == "print_not_admitted", refused
                     refused = await upload(prep["job_path"], "/restart.gcode.3mf")
                     assert refused.get("error") == "job_not_prepared", refused
+                    assert (await start("/p2-restart.gcode.3mf")).get("error") == "print_not_admitted"
+                    refused = await upload(flat["job_path"], "/p2-restart.gcode.3mf")
+                    assert refused.get("error") == "job_not_prepared", refused
+                    other_p2 = await prepare_as("mid_deck_flat")
+                    assert (await upload(other_p2["job_path"], "/other-model-p2.gcode.3mf")).get("admission")
+                    refused = await start("/other-model-p2.gcode.3mf")
+                    assert refused.get("error") == "printer_model_mismatch", refused
                     other = await prepare("rim_ok")
                     assert other.get("success"), other
                     assert (await upload(other["job_path"], "/other-model.gcode.3mf")).get("admission")

@@ -671,10 +671,12 @@ The server runs the fixed command an operator configured in its own environment
 (``BAMBU_PREFLIGHT_COMMAND_JSON``) with a new output directory it chose and ``part``; for
 the Soyrack guide that preparer renders the CAD, slices it with the installed Bambu Studio
 and runs its geometry and support checks. The job is admitted only when the process exits 0
-and its ``preflight.json`` says ``schema_version`` 2, ``geometry_policy_version`` 1,
-``pass`` true, ``state`` complete, exactly this part with no problems, ``geometry.pass``
-true from policy 1, and a ``target`` (printer_model, one nozzle_diameter, plate_type)
-qualified for that policy (a single-nozzle Bambu Lab P1S today) which the job's own plate
+and its ``preflight.json`` says ``schema_version`` 2, the part's one geometry policy at both
+the report and part level (1, or 2 for ``mid_deck_flat`` and ``mid_deck_pocket_coupon`` with
+a passing ``geometry.release_interface``, extension ``plug_release_gap``), ``pass`` true,
+``state`` complete, exactly this part with no problems, ``geometry.pass`` true, and a
+``target`` (printer_model, one nozzle_diameter, plate_type) qualified for that policy (a
+single-nozzle Bambu Lab P1S today; 0.4 mm only for policy 2) which the job's own plate
 G-code also declares; and the job's SHA-256 matches what the server computes itself. It
 sends nothing to any printer.
 
@@ -690,7 +692,8 @@ sends nothing to any printer.
 Success: ``{"success": True, "receipt_id", "part", "job_path", "sha256", "md5", "size",
 "plates", "plate_gcode_bytes", "target": {"printer_model", "nozzle_diameter", "plate_type", "bed_type"},
 "run_dir", "report_sha256", "prepared_at", "report": <summary copied from the
-preparer's report, incl. command, command_sha256, slicer, minutes, grams, watch>,
+preparer's report, incl. geometry_policy_version, part (name, geometry and its
+release_interface, slicer, minutes, grams, watch), command, command_sha256>,
 "valid_until": "server restart", "next": <the upload call to make>}``. Pass
 ``job_path`` unchanged as ``upload_file``'s ``local_path``.
 Refusals are ``{"error": code, "detail": str, ...}`` with code ``invalid_part``,

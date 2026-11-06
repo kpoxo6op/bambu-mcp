@@ -6,10 +6,17 @@ Soyrack preflight. It renders, slices and checks NOTHING: the part name selects 
 real preparer can produce (a pass, a failed process, a forged or incomplete report, a symlinked
 job, a hang), so the campaign proves which of them the server admits. Real CAD, slicer and
 support geometry are covered by the Soyrack repository's own preflight E2E.
+
+The geometry policy parts must be judged under their exact names, so the campaign chooses their
+outcome in the scenario file (JSON): "real" copies a preparer output from run.py's
+--preparer-artifacts; otherwise fixtures/preflight-<anchor>.json, a report the real preparer wrote
+at the commit in its "commit" field, gets a fixture job and the scenario's edits.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -20,6 +27,31 @@ out, part = Path(sys.argv[1]), sys.argv[2]
 out.mkdir()  # a new run never reuses a directory; an existing one fails here
 (out / part).mkdir()
 job = out / part / f"{part}.gcode.3mf"
+try:
+    scenario = json.loads(Path(os.environ["BAMBU_HARNESS_PREPARER_SCENARIO"]).read_text())
+except (KeyError, OSError):
+    scenario = {}
+if "real" in scenario:
+    source = Path(os.environ["BAMBU_HARNESS_PREPARER_ARTIFACTS"]) / scenario["real"]
+    shutil.copyfile(source / "preflight.json", out / "preflight.json")
+    if (source / part / job.name).exists():
+        shutil.copyfile(source / part / job.name, job)
+    sys.exit(0)
+anchor = Path(__file__).resolve().parent / "fixtures" / f"preflight-{scenario.get('anchor', part)}.json"
+if anchor.exists():
+    report = json.loads(anchor.read_text())
+    (name, entry), = report["parts"].items()
+    report["parts"] = {part: entry}
+    job.write_bytes(project_archive(marker=part, **scenario.get("job", {})))
+    entry["job"] = hashlib.sha256(job.read_bytes()).hexdigest()
+    sections = {"report": report, "entry": entry, "target": entry["target"], "geometry": entry["geometry"],
+                "interface": entry["geometry"].get("release_interface", {})}
+    for section, key, value in scenario.get("set", []):
+        sections[section][key] = value
+    for section, key in scenario.get("delete", []):
+        del sections[section][key]
+    (out / "preflight.json").write_text(json.dumps(report))
+    sys.exit(0)
 # job_target_mismatch: the report names the P1S 0.4 target, but the job's G-code was sliced for 0.6.
 # big_gcode: a small deflated job whose plate G-code unpacks to 24 MiB (the 2026-11-03 job was 1.4 MB
 # compressed and 6.9 MB unpacked).

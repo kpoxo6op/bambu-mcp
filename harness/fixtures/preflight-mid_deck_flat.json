@@ -1,0 +1,422 @@
+{
+  "schema_version": 2,
+  "geometry_policy_version": 2,
+  "pass": true,
+  "state": "complete",
+  "checkedAt": "2026-11-06T21:32:58.119Z",
+  "profiles": {
+    "machine.json": "5c44b3f1da0cc041d1b5dff9bdd98fa3d031574cd962185fa4270c69e3644d33",
+    "process.json": "f2c44fbb50a1f7954cec130d4e5fd19070d4e870cd7f39d6f0cb4a72c8077e0e",
+    "filament.json": "71626a07cae64316255befdf9e2aedcd987a2aaa16c596cda8b2c80cce8518b5"
+  },
+  "parts": {
+    "mid_deck_flat": {
+      "stl": "ac89feead910134125c2f7ba6122a1e7e5963073f2e34af90633c0c2b5fcba98",
+      "triangles": 6934,
+      "problems": [],
+      "process": {
+        "overlay": {
+          "enable_support": "1",
+          "support_type": "normal(manual)"
+        },
+        "sha256": "cfcbe90b810abd71914bc45061ca8175291875dc4e4b826235bfeddddb583400"
+      },
+      "geometry": {
+        "policy_version": 2,
+        "pass": true,
+        "layers_checked": 40,
+        "max_bridge_mm": 8,
+        "failures": [],
+        "bridges": [
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 2.444,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              57.485,
+              235.913
+            ],
+            "to": [
+              58.7131021229707,
+              237.96000999999998
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.031,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              58.712368021822996,
+              239.04001
+            ],
+            "to": [
+              56.03999,
+              241.70987754320439
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.031,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              54.95999,
+              241.71036262411545
+            ],
+            "to": [
+              52.286589205096924,
+              239.04001
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.035,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              52.287583553950775,
+              237.96000999999998
+            ],
+            "to": [
+              54.95999,
+              235.28636794087862
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 1.532,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              56.03999,
+              235.28560169040716
+            ],
+            "to": [
+              57.438,
+              235.876
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 2.07,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              57.237,
+              236.236
+            ],
+            "to": [
+              58.29812595095852,
+              237.96000999999998
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 3.387,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              58.29704637761574,
+              239.04001
+            ],
+            "to": [
+              56.03999,
+              241.2937654316342
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 3.385,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              54.95999,
+              241.2934079637124
+            ],
+            "to": [
+              52.70495222012193,
+              239.04001
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 3.391,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              52.70387530484379,
+              237.96000999999998
+            ],
+            "to": [
+              54.95999,
+              235.70063077349806
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 1.263,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              56.03999,
+              235.7003721933055
+            ],
+            "to": [
+              57.189,
+              236.2
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 1.701,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              56.994,
+              236.553
+            ],
+            "to": [
+              57.88897923977264,
+              237.96000999999998
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 2.758,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              57.88601546357145,
+              239.04001
+            ],
+            "to": [
+              56.03999,
+              240.8905368471049
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 2.776,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              54.95999,
+              240.89676229980924
+            ],
+            "to": [
+              53.097884459325186,
+              239.04001
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 2.78,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              53.09637169775945,
+              237.96000999999998
+            ],
+            "to": [
+              54.95999,
+              236.09994584259775
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 1.002,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              56.03999,
+              236.10522066476594
+            ],
+            "to": [
+              56.946,
+              236.517
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.032,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              58.71318138449938,
+              14.04001
+            ],
+            "to": [
+              56.03999,
+              16.7098297503997
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.03,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              54.95999,
+              16.7099966348551
+            ],
+            "to": [
+              52.28779402631571,
+              14.04001
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.033,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              52.28880129026103,
+              12.96001
+            ],
+            "to": [
+              54.95999,
+              10.286563377640086
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 4.037,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              56.03999,
+              10.285755466405808
+            ],
+            "to": [
+              58.71551252079894,
+              12.96001
+            ]
+          },
+          {
+            "layer": 16,
+            "z": 3.2,
+            "feature": "Overhang wall",
+            "unsupported_mm": 3.39,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              58.29825108899252,
+              14.04001
+            ],
+            "to": [
+              56.03999,
+              16.29802575341445
+            ]
+          }
+        ],
+        "release_interface": {
+          "extension": "plug_release_gap",
+          "pass": true,
+          "failures": [],
+          "ceiling_z": 3,
+          "plug_top_z": 2.6,
+          "air_layers": 2,
+          "air_mm": 0.4,
+          "solid_in_air_mm2": 0,
+          "plug_top_area_mm2": [
+            77.5,
+            77.5,
+            77.5,
+            77.5
+          ],
+          "min_wall_gap_mm": 0.4,
+          "min_bead_gap_mm": 0.4,
+          "min_ceiling_bead_clearance_mm": 0.286,
+          "spans_over_plug": 1094,
+          "load_line": {
+            "excluded_corner_clearance_mm": 5.65,
+            "load_line_bounds_mm": [
+              17.593,
+              0.579,
+              240.421,
+              11.443
+            ],
+            "first_layer_bounds_mm": [
+              23.65,
+              3.5,
+              232.35,
+              248.5
+            ],
+            "bead_clearance_mm": 1.593,
+            "overlap_mm2": 0
+          }
+        },
+        "failures_count": 0,
+        "bridges_count": 1094,
+        "evidence_sha256": "100dc053a02cca3f61ca05ebb52dd30b72db45f0802166db5e2cdb93f0821243"
+      },
+      "target": {
+        "printer_model": "Bambu Lab P1S",
+        "nozzle_diameter": [
+          "0.4"
+        ],
+        "plate_type": "Textured PEI Plate"
+      },
+      "slicer": "BambuStudio 02.08.02.61",
+      "job": "bbca5b11ec305d98c7d45407e653f190b1b0e9c6cadf6d166c0bda8271e4b3b8",
+      "minutes": 282,
+      "grams": 130,
+      "watch": [
+        {
+          "layer": 16,
+          "z": 3.2,
+          "percent": 55,
+          "mm": 658,
+          "longestMm": 32
+        }
+      ]
+    }
+  },
+  "commit": "bf7b6b68a8b20aaf659b10a3547a8be7e6923d9a",
+  "source": "8a0c6b01d72d570253241d51432d2866abaf1bf28c80269e96224083810e80a6",
+  "preflight": "cd3806519dd5d66871713a3fb2d29cd1b7d9d4becbb8a282aaf2068920c75296",
+  "renderer": "c2d3b4f89138b4c6982c5b77751d2f630ec7673d572a558583ae0fe38a4daaaa",
+  "dependencies": "d88c5ed542c9a71fa7aca488ba2cbe04492f1e6d702f338a2c6d65b80ab4d6aa",
+  "support_checker": "26eaddd9fe2d1ced585a557dea3468d75fca3c4a9700c3bd3502bc3324fd586d",
+  "support_dependencies": "442c73f44a4f1f17fed9cb25aae90b153220edca59fe79ae30ad503f80c2dd59"
+}

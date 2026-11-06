@@ -1,0 +1,378 @@
+{
+  "schema_version": 2,
+  "geometry_policy_version": 1,
+  "pass": true,
+  "state": "complete",
+  "checkedAt": "2026-11-06T21:33:13.530Z",
+  "profiles": {
+    "machine.json": "5c44b3f1da0cc041d1b5dff9bdd98fa3d031574cd962185fa4270c69e3644d33",
+    "process.json": "f2c44fbb50a1f7954cec130d4e5fd19070d4e870cd7f39d6f0cb4a72c8077e0e",
+    "filament.json": "71626a07cae64316255befdf9e2aedcd987a2aaa16c596cda8b2c80cce8518b5"
+  },
+  "parts": {
+    "top_cap": {
+      "stl": "4f85fa9560509c639241b4397b5852ac4265396c26d9a81a8ee3a6932bc3d50c",
+      "triangles": 12620,
+      "problems": [],
+      "geometry": {
+        "policy_version": 1,
+        "pass": true,
+        "layers_checked": 80,
+        "max_bridge_mm": 8,
+        "failures": [],
+        "bridges": [
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              151.78757,
+              223.8028247032587
+            ],
+            "to": [
+              150.87197,
+              223.9472571445476
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.812,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              147.7693888687992,
+              224.43667759788556
+            ],
+            "to": [
+              146.96748310515613,
+              224.56317520287314
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.933,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              143.7877089221517,
+              225.06477256853367
+            ],
+            "to": [
+              142.86639735751285,
+              225.21010598756874
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.907,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              140.93407551802426,
+              225.5149224583346
+            ],
+            "to": [
+              140.03809755046342,
+              225.65625959812914
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.917,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              140.2511209861239,
+              226.0047867964111
+            ],
+            "to": [
+              141.1573486689024,
+              225.8618389050692
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.94,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              142.7184783199689,
+              225.6155871120903
+            ],
+            "to": [
+              143.64732534307834,
+              225.46907125756948
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.817,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              147.09329508028253,
+              224.9255057530915
+            ],
+            "to": [
+              147.90073609603442,
+              224.79814042009835
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              150.87197,
+              224.32945950323065
+            ],
+            "to": [
+              151.78757,
+              224.1850332273621
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              151.78757,
+              224.56679488140125
+            ],
+            "to": [
+              150.87197,
+              224.71121610986495
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.823,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              148.03193192768046,
+              225.15918660712148
+            ],
+            "to": [
+              147.21896234017254,
+              225.28741953256002
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.948,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              143.50710290047095,
+              225.87290588049174
+            ],
+            "to": [
+              142.57072878557963,
+              226.02060389269602
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.829,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              147.3449823188685,
+              225.6503491199347
+            ],
+            "to": [
+              148.16348791602476,
+              225.52122393236144
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              150.87197,
+              225.09394126215471
+            ],
+            "to": [
+              151.78757,
+              224.94949872913745
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              151.78757,
+              225.33146631765052
+            ],
+            "to": [
+              150.87197,
+              225.47589747372555
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.834,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              148.2947459213037,
+              225.88244121897517
+            ],
+            "to": [
+              147.47070780970708,
+              226.01242896155685
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.927,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              150.87197,
+              225.85791231791413
+            ],
+            "to": [
+              151.78757,
+              225.71347730507875
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.069,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              151.78757,
+              226.09559001537437
+            ],
+            "to": [
+              151.7194425397857,
+              226.10634
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.932,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              135.82359,
+              225.9387132542199
+            ],
+            "to": [
+              136.74392999999998,
+              225.79353536491834
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.897,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              139.82494160315835,
+              225.30752501932847
+            ],
+            "to": [
+              140.71067382796025,
+              225.16780629050746
+            ]
+          },
+          {
+            "layer": 4,
+            "z": 0.8,
+            "feature": "Bridge",
+            "unsupported_mm": 0.925,
+            "end_anchors": true,
+            "spans_gap": true,
+            "from": [
+              143.01439562569385,
+              224.80440855908975
+            ],
+            "to": [
+              143.9281708045183,
+              224.66026622934436
+            ]
+          }
+        ],
+        "failures_count": 0,
+        "bridges_count": 293,
+        "evidence_sha256": "7c9c9bebcbf3403d03e661abe8d8973a7c7bcaaecbdbadc69849b621d8d0186f"
+      },
+      "target": {
+        "printer_model": "Bambu Lab P1S",
+        "nozzle_diameter": [
+          "0.4"
+        ],
+        "plate_type": "Textured PEI Plate"
+      },
+      "slicer": "BambuStudio 02.08.02.61",
+      "job": "b5230960332c3237d0df8533e4bb14a302f8104f1145ac8229850cfc3c26cd82",
+      "minutes": 331,
+      "grams": 156,
+      "watch": [
+        {
+          "layer": 23,
+          "z": 4.6,
+          "percent": 76,
+          "mm": 133,
+          "longestMm": 5.8
+        }
+      ]
+    }
+  },
+  "commit": "bf7b6b68a8b20aaf659b10a3547a8be7e6923d9a",
+  "source": "8a0c6b01d72d570253241d51432d2866abaf1bf28c80269e96224083810e80a6",
+  "preflight": "cd3806519dd5d66871713a3fb2d29cd1b7d9d4becbb8a282aaf2068920c75296",
+  "renderer": "c2d3b4f89138b4c6982c5b77751d2f630ec7673d572a558583ae0fe38a4daaaa",
+  "dependencies": "d88c5ed542c9a71fa7aca488ba2cbe04492f1e6d702f338a2c6d65b80ab4d6aa",
+  "support_checker": "26eaddd9fe2d1ced585a557dea3468d75fca3c4a9700c3bd3502bc3324fd586d",
+  "support_dependencies": "442c73f44a4f1f17fed9cb25aae90b153220edca59fe79ae30ad503f80c2dd59"
+}
