@@ -139,6 +139,20 @@ Replay a failure:
   refused in quiet hours, returns the light off at its deadline when the caller never ends it and
   when the server is killed and restarted past it, gives no lease to a light already on (which
   stays on), and is cut at the next quiet-hours start. Disabled quiet hours send nothing.
+* Night speed operator (`ops/night-speed/README.md`). `harness/night_speed_campaign.py` runs the
+  actual `ops/night_speed.py` as its own process against the real server; the fixture entrypoint
+  only reads the campaign's clock, shortens the settle retry and injects a kill around the send,
+  and a last pass runs the plain file on the real clock as the unit does. Invalid, unreviewed,
+  shared, linked or disabled policies, a wrong-mode event (22:29:59, 08:29:59, June NZST, the two
+  DST mornings), an unrelated job, PAUSE, PREPARE, IDLE, active HMS, an unreachable MCP and stale
+  telemetry send nothing and leave no intent. Quiet at 22:30 and Standard at 08:30 each arrive as
+  one exact `print_speed` packet (param 1, 2) and are recorded `sent_unconfirmed`, while the peer's
+  `spd_lvl` appears in no read tool. Duplicates and four concurrent runs send nothing more; a
+  replacement job (other name; same name restarted) and a paused job get no Standard and no resume.
+  A kill before or after the call, a lost answer and a full MQTT socket are unknown and never
+  replayed, also after a reconnect. Dry runs create no record. The whole campaign sees only speed
+  packets, one MQTT client and no FTPS. That is the helper's wire behaviour; no physical printer
+  has changed speed for it.
 * The camera peer authenticates over TLS and sends two distinct JPEG frames.
   MCP must return the fresh second frame, reject an oversized header and allow
   another capture after that error.

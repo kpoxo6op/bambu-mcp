@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply the %i speed profile to the reviewed print if its window and gates allow
+# Deliberately no Requires/Wants on bambu-mcp.service: this must never start or restart the server.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/bambu-mcp/.venv-candidate/bin/python -I %h/.local/share/bambu-night-speed/night_speed.py boundary --mode %i --config %h/.config/bambu-mcp/night-speed.json --state-dir %h/.local/state/bambu-mcp/night-speed
+WorkingDirectory=%h/.local/share/bambu-night-speed
+# Longer than gate_settle_s (at most 240) plus one attempt (30). A kill leaves an intent without an
+# outcome: unknown, never replayed.
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=true

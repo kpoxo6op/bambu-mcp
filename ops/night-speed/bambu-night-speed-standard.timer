@@ -1,0 +1,12 @@
+[Unit]
+Description=Standard boundary for the reviewed print, 08:30 Auckland
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Pacific/Auckland
+AccuracySec=1s
+# A missed event runs at the next start; the helper applies it only inside its own window.
+Persistent=true
+Unit=bambu-night-speed@standard.service
+
+[Install]
+WantedBy=timers.target
