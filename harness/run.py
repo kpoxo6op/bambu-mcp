@@ -126,6 +126,7 @@ def main():
         corpus = []
     seeds = list(dict.fromkeys(corpus+[seed+i for i in range(args.rounds)]))
     jobs = [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
+    jobs.append(["harness/night_speed_campaign.py"])  # no seed: its fixed sequence takes ~40 s
     for i, cmd in enumerate(jobs):
         # A campaign takes ~110 s at 8 cycles (2026-11-05, quiet-hours scenario added to ~94 s).
         result = run_child(cmd, args.python, run/f"{i:02}.log", max(180, args.cycles*20))
