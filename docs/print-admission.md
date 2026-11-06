@@ -36,19 +36,50 @@ All of these must hold for `<out>/preflight.json` and the job, or nothing is adm
 1. Exit status 0, within `BAMBU_PREFLIGHT_TIMEOUT_S` (the whole process group is
    killed on timeout, and again after exit).
 2. `preflight.json` is a regular file (not a symlink), at most 8 MiB, a JSON object.
-3. `schema_version == 2` and `geometry_policy_version == 1` (integers).
+3. `schema_version == 2` and `geometry_policy_version` is the part's one policy
+   (integers; see [Geometry policy by part](#geometry-policy-by-part)).
 4. `pass is true`, `state == "complete"`, `error` absent or empty.
 5. `parts` has exactly one key, the requested part; its `problems` is `[]`; its
-   `geometry.pass is true` and `geometry.policy_version == 1`.
+   `geometry.pass is true` and `geometry.policy_version` is the same policy.
 6. `parts[part].target` is `{printer_model, nozzle_diameter, plate_type}`: a printer
-   qualified for the geometry policy (policy 1: `Bambu Lab P1S` only), exactly one
-   nozzle diameter, and a known Bambu Studio bed type (`Cool Plate`, `Engineering
+   qualified for the geometry policy (`Bambu Lab P1S` only; policy 2 also needs nozzle
+   `"0.4"` exactly), exactly one nozzle diameter, and a known Bambu Studio bed type (`Cool Plate`, `Engineering
    Plate`, `High Temp Plate`, `Textured PEI Plate`). Missing or unknown fails.
 7. `parts[part].job` is the SHA-256 the server computes for
    `<out>/<part>/<part>.gcode.3mf`, a regular file (no symlink in the run), 1 B to
    512 MiB, a ZIP with at least one `Metadata/plate_<N>.gcode`. Those N are the
    admitted plates, and each plate's G-code header (`; printer_model`,
    `; nozzle_diameter`, `; curr_bed_type`) must declare the same target.
+
+### Geometry policy by part
+
+Each part has exactly one policy, in `PART_GEOMETRY_POLICY`:
+
+| Part | Policy |
+|---|---|
+| `mid_deck_flat`, `mid_deck_pocket_coupon` | 2 |
+| every other part | 1 |
+
+Any other version is refused, including a future policy, policy 2 for another part
+and policy 1 for the two named parts. On 2026-11-07 the qualified mid-deck design
+became a separate plug under a real 0.4 mm gap, after policy 1 had passed candidates
+with the plug welded to the deck, so a policy 1 run of these parts must not be
+readmitted.
+
+Policy 2 also requires, with exact types:
+
+* `geometry.failures == []` and `geometry.failures_count == 0`;
+* `geometry.release_interface` is an object with `extension == "plug_release_gap"`,
+  `pass is true` and `failures == []`;
+* target `Bambu Lab P1S` with `nozzle_diameter == ["0.4"]`.
+
+A policy 1 report that carries `geometry.release_interface` is refused, so policy 2
+evidence cannot be relabelled for another part.
+
+The receipt's `report` carries the evidence: `geometry_policy_version`, `part.name`
+and `part.geometry` with its `release_interface`. The server only reads the verdict;
+gap, bead and load-line measurements remain the preparer's job. Admitting another part
+or policy is a code change that needs its own review.
 
 ### Printer match at start
 
@@ -129,7 +160,9 @@ live receipt uses are never pruned).
 
 ## Rollback
 
-Redeploy the previous release. Unsetting `BAMBU_PREFLIGHT_COMMAND_JSON` does not
+Redeploy the previous release. A release before policy 2 refuses the two named parts
+at policy 2, as it refuses any job it did not prepare; receipts and bindings are lost
+with the restart either way. Unsetting `BAMBU_PREFLIGHT_COMMAND_JSON` does not
 re-open unchecked printing: it only makes `prepare_print_job` refuse, so no job can
 be admitted and every start is refused.
 

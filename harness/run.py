@@ -60,14 +60,16 @@ def interpreter_dirs(python):
             dirs |= {Path(value.strip()).parent, Path(value.strip()).resolve().parent}
     return sorted(d for d in dirs if d.is_dir())
 
-def run_child(args, python, log, timeout):
+def run_child(args, python, log, timeout, artifacts=None):
     env = {"PATH":"/usr/local/bin:/usr/bin:/bin", "LANG":"C.UTF-8",
            "PYTHONDONTWRITEBYTECODE":"1", "PYTHONUNBUFFERED":"1"}
     # The real home directory (Bambu Studio's LAN access code, printer.env, MCP configs) and
     # the private evidence directory are hidden; only the checkout and interpreter come back.
     hide = ["--tmpfs", str(Path.home())]
-    for d in [ROOT, *interpreter_dirs(python)]:
+    for d in [ROOT, *interpreter_dirs(python), *([artifacts] if artifacts else [])]:
         hide += ["--ro-bind", str(d), str(d)]
+    if artifacts:
+        hide += ["--setenv", "BAMBU_HARNESS_PREPARER_ARTIFACTS", str(artifacts)]
     if (ROOT/"evidence").is_dir():
         hide += ["--tmpfs", str(ROOT/"evidence")]
     cmd = ["/usr/bin/bwrap", "--unshare-user", "--uid", "0", "--gid", "0",
@@ -97,7 +99,10 @@ def main():
     ap.add_argument("--seed", type=int)
     ap.add_argument("--python", type=Path, default=ROOT/".venv-candidate/bin/python")
     ap.add_argument("--output", type=Path, default=ROOT/"evidence/harness")
+    ap.add_argument("--preparer-artifacts", type=Path,
+                    help="real preparer outputs (read-only) the campaign also runs; see harness/README.md")
     args = ap.parse_args()
+    artifacts = args.preparer_artifacts.resolve() if args.preparer_artifacts else None
     if not 1 <= args.rounds <= 1000 or not 4 <= args.cycles <= 1000:
         ap.error("rounds must be 1..1000; cycles 4..1000")
     os.umask(0o077)
@@ -112,7 +117,8 @@ def main():
     run.mkdir()
     seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     report = {"started":stamp,"source_sha256":source_hash(),"python":str(args.python),
-              "seed":seed,"network":"isolated loopback-only namespace", "results":[],"passed":False}
+              "seed":seed,"network":"isolated loopback-only namespace", "preparer_artifacts":str(artifacts),
+              "results":[],"passed":False}
     # Preserve exact installed versions alongside each run. The local BPM build and the
     # transport libraries are also fingerprinted by installed file content: a rebuilt local
     # dependency keeps its version string, so the version alone does not identify it.
@@ -128,8 +134,9 @@ def main():
     jobs = [["harness/wire_campaign.py", str(s), str(args.cycles)] for s in seeds]
     jobs.append(["harness/night_speed_campaign.py"])  # no seed: its fixed sequence takes ~40 s
     for i, cmd in enumerate(jobs):
-        # A campaign takes ~110 s at 8 cycles (2026-11-05, quiet-hours scenario added to ~94 s).
-        result = run_child(cmd, args.python, run/f"{i:02}.log", max(180, args.cycles*20))
+        # A campaign takes ~110 s at 8 cycles (2026-11-05, quiet-hours scenario added to ~94 s),
+        # and ~20 s more since 2026-11-07 (geometry policy by part).
+        result = run_child(cmd, args.python, run/f"{i:02}.log", max(180, args.cycles*20), artifacts)
         report["results"].append(result)
         print(json.dumps(result), flush=True)
         (run/"report.json").write_text(json.dumps(report, indent=2))

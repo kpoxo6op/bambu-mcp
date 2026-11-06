@@ -104,6 +104,22 @@ Replay a failure:
   The fixture renders, slices and checks no geometry: it only produces the outcomes
   a real preparer can, at the same process boundary. The real Soyrack renderer and
   slicer are tested in that repository.
+* Geometry policy by part (`docs/print-admission.md`). `harness/fixtures/preflight-*.json` are
+  reports the real preparer wrote at soyspray `bf7b6b68`, unedited. Through the real boundary, each of
+  `mid_deck_flat` and `mid_deck_pocket_coupon` at policy 2 and `top_cap` at policy 1 prepares,
+  uploads, reads back and starts exactly once, and the receipt reports the policy, part and release
+  interface. Each refusal is matched on its reason and leaves no receipt, upload or start: report and
+  part versions that are wrong, missing or the wrong type, policy 3, policy 1 of the named parts, a
+  missing, failed or malformed release interface, an unknown extension, reported failures, another
+  printer or nozzle, a job header contradicting the target, and policy 2 or its relabelled evidence
+  for any other part. A policy 2 receipt also keeps the storage, plate, nozzle, card read-back,
+  edited-job, one-start, restart and printer model guards. The jobs here are fixtures, so this
+  proves admission, not manufacturing.
+* `--preparer-artifacts DIR` (optional, read-only, not available in CI) also runs real preparer
+  outputs through the same boundary: `DIR/<name>/preflight.json` and
+  `DIR/<name>/<part>/<part>.gcode.3mf`, for `mid_deck_flat-bf7b6b68`,
+  `mid_deck_pocket_coupon-bf7b6b68`, `top_cap-bf7b6b68` (admitted, one start) and `fused-b843191d`,
+  `fused-1ed5c1a3`, `gap-shared-profile`, `welded-fins`, `flat-without-plugs` (refused).
 * SD card space (`docs/storage-space.md`). On 2026-11-03 an admitted 1.4 MB job was uploaded and
   started on a card with 38 free clusters; the P1S could not unpack its 6.9 MB plate G-code (HMS
   0500-4003). The fixture card carries an attestation record (1 GiB) and a listed-only dashcam file

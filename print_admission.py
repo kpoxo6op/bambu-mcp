@@ -54,10 +54,17 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-GEOMETRY_POLICY_VERSION = 1
+GEOMETRY_POLICY_VERSION = 1   # every part not named in PART_GEOMETRY_POLICY
+# The one policy each named part is judged by; see docs/print-admission.md. 2026-11-07: policy 1
+# passed mid-deck jobs whose pocket plugs were welded to the deck, so a policy 1 run of these parts
+# is refused, and policy 2 of any other part or a future policy is refused until reviewed here.
+PART_GEOMETRY_POLICY = {"mid_deck_flat": 2, "mid_deck_pocket_coupon": 2}
+RELEASE_INTERFACE_EXTENSION = "plug_release_gap"
 # Printers a geometry policy is qualified for: Bambu Studio printer_model -> bpm PrinterModel
-# name. Policy 1 was qualified on a single-nozzle P1S only; anything else is refused.
-QUALIFIED_MODELS = {1: {"Bambu Lab P1S": "P1S"}}
+# name. Both were qualified on a single-nozzle P1S only; anything else is refused.
+QUALIFIED_MODELS = {1: {"Bambu Lab P1S": "P1S"}, 2: {"Bambu Lab P1S": "P1S"}}
+# Policies qualified for specific nozzles only (policy 2's gap is measured from 0.4 mm beads).
+QUALIFIED_NOZZLES = {2: ("0.4",)}
 # Bambu Studio curr_bed_type -> bpm PlateType name (the project_file bed_type, lower-cased).
 PLATE_TYPES = {"Cool Plate": "COOL_PLATE", "Engineering Plate": "ENG_PLATE",
                "High Temp Plate": "HOT_PLATE", "Textured PEI Plate": "TEXTURED_PLATE"}
@@ -337,9 +344,10 @@ def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int
     expect(isinstance(report, dict), "preflight.json is not a JSON object")
     version = report.get("schema_version")
     expect(type(version) is int and version == SCHEMA_VERSION, f"schema_version is {version!r}, not {SCHEMA_VERSION}")
+    required = PART_GEOMETRY_POLICY.get(part, GEOMETRY_POLICY_VERSION)
     policy = report.get("geometry_policy_version")
-    expect(type(policy) is int and policy == GEOMETRY_POLICY_VERSION,
-           f"geometry_policy_version is {policy!r}, not {GEOMETRY_POLICY_VERSION}")
+    expect(type(policy) is int and policy == required,
+           f"geometry_policy_version is {policy!r}, not {required} (the only policy for part {part!r})")
     expect(report.get("pass") is True, "the report does not say pass: true")
     expect(report.get("state") == "complete", f"the report state is {report.get('state')!r}, not 'complete'")
     expect(not report.get("error"), f"the report carries an error: {report.get('error')!r}")
@@ -351,9 +359,13 @@ def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int
            f"the part has problems: {entry.get('problems')!r}")
     geometry = entry.get("geometry")
     expect(isinstance(geometry, dict) and geometry.get("pass") is True, "geometry.pass is not true")
-    expect(geometry.get("policy_version") == GEOMETRY_POLICY_VERSION and type(geometry.get("policy_version")) is int,
-           f"the geometry check ran policy {geometry.get('policy_version')!r}, not {GEOMETRY_POLICY_VERSION}")
-    target = _target(entry.get("target"), expect)
+    expect(geometry.get("policy_version") == required and type(geometry.get("policy_version")) is int,
+           f"the geometry check ran policy {geometry.get('policy_version')!r}, not {required}")
+    if required == 2:
+        _check_release_interface(geometry, expect)
+    else:
+        expect("release_interface" not in geometry, f"part {part!r} may not report a release interface")
+    target = _target(entry.get("target"), expect, required)
     claimed = entry.get("job")
     expect(isinstance(claimed, str) and re.fullmatch(r"[0-9a-f]{64}", claimed or ""),
            "the part entry has no job SHA-256")
@@ -391,18 +403,35 @@ def _validate(out: Path, part: str) -> tuple[dict, str, str, str, int, tuple[int
     summary = {k: report.get(k) for k in ("commit", "source", "preflight", "renderer", "dependencies",
                                            "support_checker", "support_dependencies", "profiles", "checkedAt")
                if k in report}
-    summary["part"] = {k: entry.get(k) for k in ("stl", "triangles", "slicer", "minutes", "grams", "watch",
-                                                  "geometry") if k in entry}
+    summary["geometry_policy_version"] = required
+    summary["part"] = {"name": part, **{k: entry.get(k) for k in ("stl", "triangles", "slicer", "minutes", "grams",
+                                                                   "watch", "geometry") if k in entry}}
     return summary, hashlib.sha256(raw).hexdigest(), sha, md5, size, plates, gcode_bytes, target
 
 
-def _target(raw, expect) -> Target:
+def _check_release_interface(geometry: dict, expect) -> None:
+    """Policy 2's own evidence, as check-support.py reports it. The server only reads the verdict."""
+    expect(type(geometry.get("failures")) is list and not geometry["failures"]
+           and type(geometry.get("failures_count")) is int and geometry["failures_count"] == 0,
+           f"the geometry check reports failures: {geometry.get('failures')!r}, "
+           f"count {geometry.get('failures_count')!r}")
+    interface = geometry.get("release_interface")
+    expect(isinstance(interface, dict), "geometry.release_interface is not an object")
+    extension = interface.get("extension")
+    expect(type(extension) is str and extension == RELEASE_INTERFACE_EXTENSION,
+           f"geometry.release_interface.extension is {extension!r}, not {RELEASE_INTERFACE_EXTENSION!r}")
+    expect(interface.get("pass") is True, "geometry.release_interface.pass is not true")
+    expect(type(interface.get("failures")) is list and not interface["failures"],
+           f"geometry.release_interface reports failures: {interface.get('failures')!r}")
+
+
+def _target(raw, expect, policy: int) -> Target:
     """The report's target, required, qualified for this geometry policy and fully known."""
     expect(isinstance(raw, dict), "the part entry has no target (printer_model, nozzle_diameter, plate_type)")
     model = raw.get("printer_model")
-    qualified = QUALIFIED_MODELS.get(GEOMETRY_POLICY_VERSION, {})
+    qualified = QUALIFIED_MODELS.get(policy, {})
     expect(isinstance(model, str) and model in qualified,
-           f"target printer {model!r} is not qualified for geometry policy {GEOMETRY_POLICY_VERSION} "
+           f"target printer {model!r} is not qualified for geometry policy {policy} "
            f"(qualified: {sorted(qualified)})")
     nozzles = raw.get("nozzle_diameter")
     expect(isinstance(nozzles, list) and len(nozzles) == 1 and all(isinstance(n, str) for n in nozzles),
@@ -412,6 +441,9 @@ def _target(raw, expect) -> Target:
     except ValueError:
         diameter = 0.0
     expect(0 < diameter < 2, f"target nozzle_diameter {nozzles[0]!r} is not a diameter in mm")
+    expect(policy not in QUALIFIED_NOZZLES or nozzles[0] in QUALIFIED_NOZZLES[policy],
+           f"target nozzle_diameter {nozzles[0]!r} is not qualified for geometry policy {policy} "
+           f"(qualified: {list(QUALIFIED_NOZZLES.get(policy, ()))})")
     plate_type = raw.get("plate_type")
     expect(isinstance(plate_type, str) and plate_type in PLATE_TYPES,
            f"target plate_type {plate_type!r} is not a known Bambu Studio bed type")
