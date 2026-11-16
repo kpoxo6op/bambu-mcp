@@ -83,12 +83,22 @@ word on a move), SD-card commands (M23/M24/M28/M29/M30/M32...), macros, tool cha
 and unknown words are refused, with nothing sent. The dedicated temperature and fan
 tools emit only allowlisted G-code.
 
+## Preparers
+
+`ops/prepare_dispatch.py` is the configured preparer. It sends a part to `ops/catalog_preparer.py` when the print
+catalog (`BAMBU_CATALOG`, default `~/code/print-catalog`) has `parts/<part>/part.json`, and every other part to the
+Soyrack `preflight.mjs` unchanged. The catalog preparer applies the same rules to any committed model: committed,
+unchanged inputs; the qualified slicer; one object kept as supplied; no slicer warning or support; overlay keys present
+in the G-code; and the Soyrack layer support checker (policy 1). It allows a brim on the first layer only, and passes
+brim moves to the checker as travels. To print something new, commit `parts/<name>/model.stl` + `part.json` to the
+catalog and call `prepare_print_job(<name>)`. See the catalog README.
+
 ## Operator setup
 
 Add to `~/.config/bambu-mcp/printer.env` (single quotes keep the JSON intact):
 
 ```sh
-BAMBU_PREFLIGHT_COMMAND_JSON='["/usr/bin/node","/path/to/apps/assembly-guide/cad/preflight.mjs"]'
+BAMBU_PREFLIGHT_COMMAND_JSON='["/usr/bin/python3","-I","/home/boris/code/bambu-print-gate-20261102/ops/prepare_dispatch.py"]'
 # optional, seconds, 1..7200 (default 1800)
 BAMBU_PREFLIGHT_TIMEOUT_S=1800
 ```

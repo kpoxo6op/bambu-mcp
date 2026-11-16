@@ -22,6 +22,7 @@
 - All printer ops route through BPM library via `session_manager.get_printer(name)`
 - BPM is considered stable — do not modify it to solve MCP-layer problems
 - No tool may open its own direct FTPS/MQTT/socket/HTTP connection (camera streaming excepted)
+- Any model can print: commit it to `~/code/print-catalog/parts/<name>/` (see its README), then `prepare_print_job(<name>)`; `ops/prepare_dispatch.py` routes catalog parts to `ops/catalog_preparer.py`, the rest to Soyrack.
 - Prints start only through `print_admission.py`: `prepare_print_job` (operator-configured preparer, `BAMBU_PREFLIGHT_COMMAND_JSON`) → `upload_file` → `print_file`; the publish guard refuses any other start, SD-card or extruding G-code. See `docs/print-admission.md`; never add an override
 - REST API server, camera stream servers and their relay children draw ports from a shared `PortPool` (default 49152-49251)
 - Port discovery: `get_server_info()` MCP tool or `GET /api/server_info` — never hardcode ports
